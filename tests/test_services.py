@@ -5,7 +5,9 @@ import pytest
 
 from netlook.core import services
 from netlook.core.actions import CredentialAction, ShareAction, SmbPrinterAction, WebAdminAction
-from netlook.core.services import Cups, DeviceInfo, Incus, Ipp, LpdPrinterService, PdlStreamService, Samba
+from netlook.core.services import (
+    Cups, DeviceInfo, Incus, IncusInstance, Ipp, LpdPrinterService, PdlStreamService, Samba, SmbShare,
+)
 
 from doubles import FakeScanner
 from factories import DeviceFactory
@@ -107,7 +109,7 @@ async def test_samba_fetch_records_a_successful_anonymous_listing(fake_smbclient
     await service.fetch()
 
     assert service.loading is False
-    assert service.shares == ["Public", "Media"]
+    assert service.shares == [SmbShare("Public"), SmbShare("Media")]
     assert service.auth_required is False
 
 
@@ -133,8 +135,8 @@ async def test_list_smb_shares_parses_both_disk_and_printer_lines(fake_smbclient
 
     shares, printers = await services.list_smb_shares("10.0.0.5")
 
-    assert shares == ["Public", "Media"]
-    assert printers == ["OfficeLaser"]
+    assert shares == [SmbShare("Public"), SmbShare("Media")]
+    assert printers == [SmbShare("OfficeLaser")]
 
 
 async def test_samba_fetch_stores_both_shares_and_printers(fake_smbclient):
@@ -145,8 +147,21 @@ async def test_samba_fetch_stores_both_shares_and_printers(fake_smbclient):
 
     await service.fetch()
 
-    assert service.shares == ["Public"]
-    assert service.printers == ["OfficeLaser"]
+    assert service.shares == [SmbShare("Public")]
+    assert service.printers == [SmbShare("OfficeLaser")]
+
+
+def test_samba_shares_and_printers_coerce_bare_strings_to_smbshare():
+    """Verify that assigning shares/printers as bare strings wraps each into an
+    SmbShare with an empty comment - so a caller that doesn't care about comments
+    (a quick script, a test) can assign plain names without importing SmbShare -
+    while an already-typed SmbShare (e.g. one with a real comment) passes through
+    unchanged."""
+    service = Samba(kind="smb", ip="10.0.0.5", port=445)
+
+    service.shares = ["Public", SmbShare("Media", "already typed")]
+
+    assert service.shares == [SmbShare("Public"), SmbShare("Media", "already typed")]
 
 
 async def test_samba_get_resources_yields_both_shares_and_printers_together():
@@ -156,8 +171,8 @@ async def test_samba_get_resources_yields_both_shares_and_printers_together():
     rather than splitting printer shares into their own dedicated tab that would be
     a dead label whenever there are none)."""
     service = Samba(kind="smb", ip="10.0.0.5", port=445)
-    service.shares = ["Public"]
-    service.printers = ["OfficeLaser"]
+    service.shares = [SmbShare("Public")]
+    service.printers = [SmbShare("OfficeLaser")]
 
     yielded = [r async for r in service.get_resources(expanded=True, scanner=None)]
 
@@ -211,7 +226,7 @@ async def test_incus_get_resources_yields_one_console_action_per_instance():
     rather than being replaced by them, so there's always something to click even
     if the instance list turns out to be empty."""
     service = Incus(kind="incus", ip="10.0.0.5", port=8443)
-    service.instances = [{"name": "web", "status": "Running"}, {"name": "db", "status": "Stopped"}]
+    service.instances = [IncusInstance("web", "Running"), IncusInstance("db", "Stopped")]
 
     yielded = [r async for r in service.get_resources(expanded=True, scanner=None)]
 
@@ -276,7 +291,7 @@ async def test_incus_fetch_records_instances_from_a_successful_payload(fake_http
     await service.fetch()
 
     assert service.accessible is True
-    assert service.instances == [{"name": "web", "status": "Running"}, {"name": "db", "status": "Stopped"}]
+    assert service.instances == [IncusInstance("web", "Running"), IncusInstance("db", "Stopped")]
     assert service.error is None
     assert service.extra_properties() == []
 

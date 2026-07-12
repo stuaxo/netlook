@@ -35,8 +35,14 @@ logger = logging.getLogger(__name__)
 HAS_SMBCLIENT = shutil.which("smbclient") is not None
 
 
+@dataclass
+class SmbShare:
+    name: str
+    comment: str = ""
+
+
 async def list_smb_shares(ip: str, username: str | None = None,
-                           password: str | None = None) -> tuple[list[str], list[str]] | None:
+                           password: str | None = None) -> tuple[list[SmbShare], list[SmbShare]] | None:
     """Returns (disk_shares, printer_shares) - either may genuinely be empty - or
     None if auth is required/failed."""
     if not HAS_SMBCLIENT:
@@ -69,8 +75,10 @@ async def list_smb_shares(ip: str, username: str | None = None,
 
     # grepable output: "Disk|ShareName|Comment" / "Printer|PrinterName|Comment"
     lines = stdout.decode(errors="replace").splitlines()
-    shares = [line.split("|")[1] for line in lines if line.startswith("Disk|")]
-    printers = [line.split("|")[1] for line in lines if line.startswith("Printer|")]
+    shares = [SmbShare(parts[1], parts[2]) for line in lines
+              if (parts := line.split("|"))[0] == "Disk"]
+    printers = [SmbShare(parts[1], parts[2]) for line in lines
+                if (parts := line.split("|"))[0] == "Printer"]
     if shares or printers or proc.returncode == 0:
         return shares, printers
     return None  # nonzero exit with nothing listed: treat as an auth failure
@@ -80,10 +88,19 @@ async def list_smb_shares(ip: str, username: str | None = None,
 @dataclass
 class Samba(Service):
     expandable: ClassVar[bool] = True
-    shares: list[str] | None = None
-    printers: list[str] | None = None
+    shares: list[SmbShare | str] | None = None
+    printers: list[SmbShare | str] | None = None
     auth_required: bool = False
     tried_auth: bool = False  # True once a *credentialed* attempt has failed
+
+    def __setattr__(self, name: str, value) -> None:
+        # Lets `shares`/`printers` be assigned as bare share names (a plain string
+        # has no comment to carry) as well as SmbShare - construction, fetch(), and
+        # any later reassignment (tests, callers) all go through this, so there's
+        # one coercion point instead of every call site remembering to wrap names.
+        if name in ("shares", "printers") and value is not None:
+            value = [v if isinstance(v, SmbShare) else SmbShare(v) for v in value]
+        super().__setattr__(name, value)
 
     @property
     def status_text(self) -> str | None:
@@ -120,11 +137,17 @@ class Samba(Service):
             yield Resource(ResourceCategory.FILE_SHARES, SmbPrinterAction.from_resource(self, printer))
 
 
+@dataclass
+class IncusInstance:
+    name: str
+    status: str
+
+
 @register("incus")
 @dataclass
 class Incus(Service):
     expandable: ClassVar[bool] = True
-    instances: list[dict] | None = None
+    instances: list[IncusInstance] | None = None
     accessible: bool = True  # False: fetched, but the server didn't trust our client
     # incus/LXD's own error message for the failed request (e.g. "not authorized"
     # for an untrusted TLS client cert) - None unless accessible is False. The
@@ -160,7 +183,7 @@ class Incus(Service):
             return
         self.accessible = True
         self.error = None
-        self.instances = [{"name": i.get("name", "?"), "status": i.get("status", "?")} for i in payload["metadata"]]
+        self.instances = [IncusInstance(i.get("name", "?"), i.get("status", "?")) for i in payload["metadata"]]
 
     async def get_resources(self, expanded: bool, scanner: "NetworkScanner") -> AsyncIterator[Resource]:
         # The general web-admin link is yielded regardless of expanded, not just
@@ -234,9 +257,9 @@ class Ipp(Service):
         # Ignores `expanded`: ipp has exactly one resource and no deeper structure
         # (unlike smb/incus/cups), so its Printers tab shows the same admin link
         # Overview does, rather than a dead, unclickable fallback label.
-        admin_url = self.properties.get(b"adminurl")
+        admin_url = self.txt("adminurl")
         if admin_url:
-            action = WebAdminAction(label="Printer admin", uri=admin_url.decode(errors="replace"))
+            action = WebAdminAction(label="Printer admin", uri=admin_url)
         else:
             action = WebAdminAction.from_service(self, path="/", scheme="http", port=80, label="Printer admin")
         yield Resource(ResourceCategory.PRINTERS, action)
@@ -248,10 +271,10 @@ class Ipp(Service):
         # set (often a location, e.g. "2nd Floor") - both are useful supplementary
         # info, so they're offered as aliases rather than promoted over a name someone
         # deliberately gave the device.
-        for key in (b"ty", b"note"):
-            value = self.properties.get(key)
+        for key in ("ty", "note"):
+            value = self.txt(key)
             if value:
-                device.add_alias(self.kind, value.decode(errors="replace"))
+                device.add_alias(self.kind, value)
 
 
 _CUPS_QUEUE_RE = re.compile(rb'href="/printers/([^"/]+)"', re.IGNORECASE)
@@ -326,6 +349,6 @@ class DeviceInfo(Service):
 
         # not a standard _device-info._tcp key, but wired up for any future service
         # (registered here or elsewhere) that advertises one.
-        icon = self.properties.get(b"icon")
+        icon = self.txt("icon")
         if icon:
-            device.icon_path = icon.decode(errors="replace")
+            device.icon_path = icon

@@ -13,6 +13,7 @@ from netlook.core.actions import (
     WebAdminAction,
     display_name,
 )
+from netlook.core.services import IncusInstance, SmbShare
 
 from doubles import FakeScanner
 
@@ -94,7 +95,7 @@ def test_share_action_from_resource_builds_an_smb_uri_labeled_with_the_share_nam
     share and labels the button with the share's own name, by checking both fields."""
     service = _FakeService(kind="smb", ip="10.0.0.5", port=445)
 
-    action = ShareAction.from_resource(service, "Public")
+    action = ShareAction.from_resource(service, SmbShare("Public"))
 
     assert action.uri == "smb://10.0.0.5/Public"
     assert action.label == "Public"
@@ -104,7 +105,7 @@ def test_incus_console_action_from_resource_labels_with_name_and_status():
     """Verify that IncusConsoleAction.from_resource labels the button with the
     instance's name and status, by checking a running-instance example."""
     service = _FakeService(kind="incus", ip="10.0.0.5", port=8443)
-    instance = {"name": "web-vm", "status": "Running"}
+    instance = IncusInstance("web-vm", "Running")
 
     action = IncusConsoleAction.from_resource(service, instance)
 

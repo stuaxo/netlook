@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .models import Service
     from .scanner import NetworkScanner
+    from .services import IncusInstance, SmbShare
 
 HAS_REMMINA = shutil.which("remmina") is not None
 SESSION_SCHEMES = {"ssh": "ssh", "rdp": "rdp", "vnc": "vnc"}
@@ -124,8 +125,8 @@ class ShareAction(Action):
     uri: str = ""
 
     @classmethod
-    def from_resource(cls, service: "Service", share: str) -> "ShareAction":
-        return cls(label=share, uri=f"smb://{service.ip}/{share}")
+    def from_resource(cls, service: "Service", share: "SmbShare") -> "ShareAction":
+        return cls(label=share.name, uri=f"smb://{service.ip}/{share.name}")
 
     async def run(self, scanner: "NetworkScanner") -> None:
         self._popen(["xdg-open", self.uri])
@@ -142,8 +143,8 @@ class SmbPrinterAction(Action):
     uri: str = ""
 
     @classmethod
-    def from_resource(cls, service: "Service", printer: str) -> "SmbPrinterAction":
-        return cls(label=printer, uri=f"smb://{service.ip}/{printer}")
+    def from_resource(cls, service: "Service", printer: "SmbShare") -> "SmbPrinterAction":
+        return cls(label=printer.name, uri=f"smb://{service.ip}/{printer.name}")
 
     async def run(self, scanner: "NetworkScanner") -> None:
         self._popen(["xdg-open", self.uri])
@@ -155,11 +156,11 @@ class IncusConsoleAction(Action):
     uri: str = ""
 
     @classmethod
-    def from_resource(cls, service: "Service", instance: dict) -> "IncusConsoleAction":
+    def from_resource(cls, service: "Service", instance: "IncusInstance") -> "IncusConsoleAction":
         # incus's web UI has no stable per-instance deep link across versions, so this
         # just opens the UI root - the label at least tells you what to look for.
         uri = f"https://{service.ip}:{service.port}/ui/"
-        return cls(label=f"{instance['name']} ({instance['status']})", uri=uri)
+        return cls(label=f"{instance.name} ({instance.status})", uri=uri)
 
     async def run(self, scanner: "NetworkScanner") -> None:
         self._popen(["xdg-open", self.uri])

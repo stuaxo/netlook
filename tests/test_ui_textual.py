@@ -9,7 +9,7 @@ from textual.widgets import Button, Collapsible, TabbedContent, TabPane
 
 from netlook.core.models import Device
 from netlook.core.scanner import NetworkScanner
-from netlook.core.services import PdlStreamService
+from netlook.core.services import PdlStreamService, SmbShare
 from netlook.ui.base import DEFAULT_SAVE_PATH
 from netlook.ui.textual import NetworkBrowserApp
 
@@ -28,7 +28,7 @@ def app_with_device():
     dev = Device("MyNAS", "10.0.0.5", names={"MyNAS": {"device-info"}})
     dev.add_service("_smb._tcp.local.", 445, {}, "MyNAS")
     smb = dev.services["smb"]
-    smb.shares = ["Public"]
+    smb.shares = [SmbShare("Public")]
     smb.printers = []
     dev.add_service("_ssh._tcp.local.", 22, {}, None)
     scanner.devices["10.0.0.5"] = dev

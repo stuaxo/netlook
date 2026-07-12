@@ -91,10 +91,18 @@ GROUPED_CATEGORIES: dict[ResourceCategory, str] = {
 }
 
 LAUNCH_KINDS = {"rdp", "vnc"}  # "ssh" gets its own subclass, in services.py
-# kind -> (scheme, path, port override or None to use the port the service was detected on)
+
+
+@dataclass
+class WebAdminConfig:
+    scheme: str
+    path: str
+    port: int | None = None  # None: use the port the service was detected on
+
+
 WEB_ADMIN = {
-    "home-assistant": ("http", "/", None),
-    "moonlight": ("https", "/", 47990),  # Sunshine's config UI, separate from its GameStream port
+    "home-assistant": WebAdminConfig("http", "/"),
+    "moonlight": WebAdminConfig("https", "/", 47990),  # Sunshine's config UI, separate from its GameStream port
     # "cups" isn't here - it gets its own Service subclass, in services.py, for per-queue actions
 }
 
@@ -137,13 +145,23 @@ class Service:
         if self.kind in LAUNCH_KINDS:
             yield Resource(next(iter(self.categories)), RemoteSessionAction.from_service(self))
         elif self.kind in WEB_ADMIN:
-            scheme, path, port = WEB_ADMIN[self.kind]
+            config = WEB_ADMIN[self.kind]
             yield Resource(next(iter(self.categories)),
-                            WebAdminAction.from_service(self, path=path, scheme=scheme, port=port))
+                            WebAdminAction.from_service(self, path=config.path, scheme=config.scheme,
+                                                         port=config.port))
 
     @property
     def status_text(self) -> str | None:
         return "loading..." if self.loading else None
+
+    def txt(self, key: str) -> str | None:
+        """Decoded value of one raw mDNS TXT record, or None if the key is absent or
+        has no value. A point-lookup convenience over the raw properties dict, which
+        stays bytes-keyed - the Properties tab's full dump (ui/base.py) iterates every
+        key directly instead, since it has to show unknown keys too, not just the
+        fixed ones a Service cares about."""
+        value = self.properties.get(key.encode())
+        return value.decode(errors="replace") if value is not None else None
 
     def extra_properties(self) -> list[tuple[str, str]]:
         """Extra (key, value) pairs to show in the Properties tab alongside this
