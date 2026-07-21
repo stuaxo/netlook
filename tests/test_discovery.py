@@ -1,5 +1,8 @@
 """Unit tests for netlook.core.discovery."""
+import asyncio
 import socket
+import threading
+import time
 
 import httpx
 import pytest
@@ -222,3 +225,29 @@ async def test_wsd_discovery_report_probes_exactly_one_address_per_service(monke
     await wsd._report(svc)
 
     assert calls == [("192.168.1.144", "4509a320-00a0-8023-00b9-4509a320be6b", "WSD")]
+
+
+async def test_wsd_discovery_stop_does_not_block_on_a_slow_underlying_stop_call():
+    """Verify that WsdDiscovery.stop() returns promptly even when the underlying
+    wsdiscovery library's own stop() is slow - a real cost in practice, since
+    ThreadedWSDiscovery.stop() joins its internal networking/address-monitor
+    threads synchronously, which can take ~1s. Blocking app shutdown on that
+    (e.g. quitting via Escape right after launch) is exactly the bug this guards
+    against - stop() must hand the slow call off to a background thread rather
+    than await it inline."""
+    wsd = WsdDiscovery()
+    slow_stop_started = threading.Event()
+
+    class SlowStop:
+        def stop(self):
+            slow_stop_started.set()
+            time.sleep(0.5)
+
+    wsd._wsd = SlowStop()
+
+    started = time.monotonic()
+    await asyncio.wait_for(wsd.stop(), timeout=0.2)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2
+    assert slow_stop_started.wait(timeout=1)  # the slow stop did still run, just not inline

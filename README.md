@@ -3,6 +3,8 @@ Netlook, network browser
 
 ![Netlook Screenshot](screenshot.png)
 
+Proof of concept (ai-slop-coded).
+
 
 Simple network browser via:
 

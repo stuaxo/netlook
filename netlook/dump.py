@@ -25,14 +25,12 @@ async def dump(output: str | None, scan_seconds: float, scanner: NetworkScanner 
         await asyncio.sleep(scan_seconds)
         await scanner.wait_idle()  # let any probe still in flight when the timer fired land
 
-        # Expanding every device (get_resources(expanded=True, ...)) is what
-        # actually triggers a service's lazy fetch (samba's share list, incus's
-        # instance list, ...) via request_items() - see Samba/Incus/Cups.
-        # get_resources. That call only *schedules* the fetch, so a second
+        # Expanding every device (build_device_row_view(..., expanded=True)) is
+        # what actually triggers a service's lazy fetch (samba's share list,
+        # incus's instance list, ...) via scanner.ensure_fetched - see
+        # ui/base.py. That call only *schedules* the fetch, so a second
         # wait_idle() is needed before rebuilding the views that capture its
-        # result - same two-phase shape as CredentialAction's own request/fetch
-        # split, just applied across every device at once instead of one at a
-        # click.
+        # result.
         devices = list(scanner.devices.values())
         for dev in devices:
             await build_device_row_view(dev, scanner, expanded=True)

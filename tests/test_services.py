@@ -4,12 +4,12 @@ import json
 import pytest
 
 from netlook.core import services
-from netlook.core.actions import CredentialAction, ShareAction, SmbPrinterAction, WebAdminAction
+from netlook.core.actions import LaunchAction
+from netlook.core.models import FetchState, ResourceCategory
 from netlook.core.services import (
-    Cups, DeviceInfo, Incus, IncusInstance, Ipp, LpdPrinterService, PdlStreamService, Samba, SmbShare,
+    Cups, DeviceInfo, Incus, IncusInstance, Ipp, LpdPrinterService, PdlStreamService, Samba, SmbShare, Ssh,
 )
 
-from doubles import FakeScanner
 from factories import DeviceFactory
 
 
@@ -39,47 +39,12 @@ def fake_smbclient(monkeypatch):
 
 
 @pytest.mark.parametrize("service_cls", [PdlStreamService, LpdPrinterService])
-async def test_silent_printer_services_never_yield_resources(service_cls):
-    """Verify that PdlStreamService and LpdPrinterService yield no resources in
-    either state, since they're machine-to-machine protocols with nothing to click,
-    by checking both expanded=False and expanded=True come back empty."""
+def test_silent_printer_services_never_yield_resources(service_cls):
+    """Verify that PdlStreamService and LpdPrinterService yield no resources at
+    all, since they're machine-to-machine protocols with nothing to click."""
     service = service_cls(kind="pdl-datastream", ip="10.0.0.20", port=9100)
 
-    collapsed = [r async for r in service.get_resources(expanded=False, scanner=None)]
-    expanded = [r async for r in service.get_resources(expanded=True, scanner=None)]
-
-    assert collapsed == []
-    assert expanded == []
-
-
-async def test_samba_get_resources_requests_a_fetch_on_first_expand():
-    """Verify that expanding a freshly-discovered Samba service (no fetch yet)
-    requests items from the scanner instead of yielding resources, by checking the
-    fake scanner recorded exactly one anonymous request_items call."""
-    service = Samba(kind="smb", ip="10.0.0.5", port=445)
-    scanner = FakeScanner()
-
-    yielded = [r async for r in service.get_resources(expanded=True, scanner=scanner)]
-
-    assert yielded == []
-    assert scanner.requested == [(service, {})]
-
-
-async def test_samba_get_resources_prompts_for_credentials_after_a_failed_anonymous_fetch():
-    """Verify that a failed anonymous fetch surfaces a CredentialAction instead of
-    re-triggering another anonymous fetch, by simulating that post-fetch state
-    directly. This is a regression test: auth_required used to be checked *after*
-    "shares is None", which looped forever re-requesting an anonymous fetch."""
-    service = Samba(kind="smb", ip="10.0.0.5", port=445)
-    service.shares = None
-    service.auth_required = True
-    scanner = FakeScanner()
-
-    yielded = [r async for r in service.get_resources(expanded=True, scanner=scanner)]
-
-    assert len(yielded) == 1
-    assert isinstance(yielded[0].action, CredentialAction)
-    assert scanner.requested == []
+    assert list(service.resources()) == []
 
 
 def test_samba_status_text_reports_loading_regardless_of_other_state():
@@ -97,6 +62,67 @@ def test_samba_status_text_reports_no_shares_found_only_for_a_genuinely_empty_fe
     service.shares = []
 
     assert service.status_text == "no shares found"
+
+
+def test_samba_status_text_reports_smbclient_missing_instead_of_no_shares_found():
+    """Verify that Samba.status_text distinguishes a missing smbclient binary from
+    a genuinely empty listing, even though both leave shares=[] - conflating them
+    used to make a device with SMB actually running masquerade as having none."""
+    service = Samba(kind="smb", ip="10.0.0.5", port=445)
+    service.shares = []
+    service.smbclient_missing = True
+
+    assert service.status_text == "smbclient not installed"
+
+
+async def test_samba_fetch_flags_smbclient_missing_without_touching_auth_state(monkeypatch):
+    """Verify that Samba.fetch reports smbclient_missing (not auth_required) when
+    the smbclient binary itself isn't installed, by forcing HAS_SMBCLIENT False -
+    the actual condition on the reporting machine - and checking neither the login
+    prompt nor "no shares found" gets shown in its place."""
+    monkeypatch.setattr(services, "HAS_SMBCLIENT", False)
+    service = Samba(kind="smb", ip="10.0.0.5", port=445, loading=True)
+
+    await service.fetch()
+
+    assert service.loading is False
+    assert service.smbclient_missing is True
+    assert service.auth_required is False
+    assert service.fetch_state == FetchState.LOADED
+    assert service.status_text == "smbclient not installed"
+
+
+@pytest.mark.parametrize("kwargs, expected_state", [
+    ({"loading": True}, FetchState.LOADING),
+    ({}, FetchState.NOT_FETCHED),
+    ({"shares": [SmbShare("Public")]}, FetchState.LOADED),
+    ({"auth_required": True}, FetchState.AUTH_REQUIRED),
+    # loading wins over every other conflicting state, matching status_text.
+    ({"loading": True, "auth_required": True}, FetchState.LOADING),
+    # auth_required wins over "shares is None" - a failed fetch also leaves shares
+    # as None, so NOT_FETCHED would misreport an auth failure as never attempted.
+    ({"shares": None, "auth_required": True}, FetchState.AUTH_REQUIRED),
+])
+def test_samba_fetch_state_reflects_loading_auth_and_shares(kwargs, expected_state):
+    """Verify that Samba.fetch_state derives the right FetchState from its
+    loading/auth_required/shares fields, across every state and the two ordering
+    cases (loading beats auth_required; auth_required beats "shares is None")."""
+    service = Samba(kind="smb", ip="10.0.0.5", port=445, **kwargs)
+
+    assert service.fetch_state == expected_state
+
+
+@pytest.mark.parametrize("kwargs, expected_fields", [
+    ({}, ()),
+    ({"shares": [SmbShare("Public")]}, ()),
+    ({"auth_required": True}, ("user", "password")),
+])
+def test_samba_fetch_fields_is_non_empty_only_when_auth_required(kwargs, expected_fields):
+    """Verify that Samba.fetch_fields only ever asks for user/password when
+    fetch_state is AUTH_REQUIRED, and is empty for every other state."""
+    service = Samba(kind="smb", ip="10.0.0.5", port=445, **kwargs)
+
+    assert service.fetch_fields() == expected_fields
 
 
 async def test_samba_fetch_records_a_successful_anonymous_listing(fake_smbclient):
@@ -151,6 +177,43 @@ async def test_samba_fetch_stores_both_shares_and_printers(fake_smbclient):
     assert service.printers == [SmbShare("OfficeLaser")]
 
 
+async def test_samba_fetch_records_the_username_behind_a_successful_credentialed_listing(fake_smbclient):
+    """Verify that Samba.fetch remembers which username a successful listing was
+    made with, so links built from it (see resources()) can carry it through
+    instead of prompting the file manager to ask for it again."""
+    fake_smbclient(stdout="Disk|Public|\n")
+    service = Samba(kind="smb", ip="10.0.0.5", port=445)
+
+    await service.fetch(user="bob", password="secret")
+
+    assert service.username == "bob"
+
+
+async def test_samba_fetch_leaves_username_unset_for_an_anonymous_listing(fake_smbclient):
+    """Verify that Samba.fetch doesn't record a username for an anonymous fetch, so
+    an anonymous listing's links stay plain smb://host/share uris."""
+    fake_smbclient(stdout="Disk|Public|\n")
+    service = Samba(kind="smb", ip="10.0.0.5", port=445)
+
+    await service.fetch()
+
+    assert service.username is None
+
+
+async def test_samba_fetch_clears_a_stale_username_after_a_failed_credentialed_retry(fake_smbclient):
+    """Verify that a failed credentialed re-fetch clears any username left over from
+    an earlier successful one, so a subsequent stale link isn't built with
+    credentials that no longer resolve to a listing."""
+    fake_smbclient(stdout="Disk|Public|\n")
+    service = Samba(kind="smb", ip="10.0.0.5", port=445)
+    await service.fetch(user="bob", password="secret")
+
+    fake_smbclient(stdout="", returncode=1)
+    await service.fetch(user="bob", password="wrong")
+
+    assert service.username is None
+
+
 def test_samba_shares_and_printers_coerce_bare_strings_to_smbshare():
     """Verify that assigning shares/printers as bare strings wraps each into an
     SmbShare with an empty comment - so a caller that doesn't care about comments
@@ -164,8 +227,25 @@ def test_samba_shares_and_printers_coerce_bare_strings_to_smbshare():
     assert service.shares == [SmbShare("Public"), SmbShare("Media", "already typed")]
 
 
-async def test_samba_get_resources_yields_both_shares_and_printers_together():
-    """Verify that Samba.get_resources yields both disk shares and printer shares
+@pytest.mark.parametrize("kwargs", [
+    {},  # NOT_FETCHED
+    {"auth_required": True},  # AUTH_REQUIRED - the login prompt itself is built
+    # entirely in ui/base.py from fetch_state, not by Samba - see
+    # test_ui_base.py's _build_entry tests.
+])
+def test_samba_resources_yields_nothing_before_a_fetch_has_landed(kwargs):
+    """Verify that Samba.resources() yields nothing until shares has actually been
+    populated by a successful fetch - covers both NOT_FETCHED and AUTH_REQUIRED,
+    which both leave shares as None. Triggering the fetch (NOT_FETCHED) and
+    surfacing a login prompt (AUTH_REQUIRED) are both the caller's job now, not
+    this method's - see NetworkScanner.ensure_fetched and ui/base.py."""
+    service = Samba(kind="smb", ip="10.0.0.5", port=445, **kwargs)
+
+    assert list(service.resources()) == []
+
+
+def test_samba_resources_yields_both_shares_and_printers_together():
+    """Verify that Samba.resources yields both disk shares and printer shares
     together - smb is single-category (see SERVICE_CATEGORIES's comment: both
     share types come from the same fetch and belong in the same File Shares tab,
     rather than splitting printer shares into their own dedicated tab that would be
@@ -174,63 +254,213 @@ async def test_samba_get_resources_yields_both_shares_and_printers_together():
     service.shares = [SmbShare("Public")]
     service.printers = [SmbShare("OfficeLaser")]
 
-    yielded = [r async for r in service.get_resources(expanded=True, scanner=None)]
+    yielded = list(service.resources())
 
-    assert {type(r.action) for r in yielded} == {ShareAction, SmbPrinterAction}
+    assert {r.action.uri for r in yielded} == {"smb://10.0.0.5/Public", "smb://10.0.0.5/OfficeLaser"}
+    assert all(isinstance(r.action, LaunchAction) for r in yielded)
+    # Not immediate: a share/printer link is only worth showing once its device
+    # row is expanded, never in the always-visible Overview row.
+    assert all(not r.immediate for r in yielded)
 
 
-async def test_samba_get_resources_yields_credential_prompt_once_auth_required():
-    """Verify that Samba.get_resources surfaces a CredentialAction once auth is
-    required, rather than the share/printer lists."""
+def test_ssh_resources_marks_the_sftp_browser_as_non_immediate():
+    """Verify that Ssh.resources marks the terminal launch as immediate (shown in
+    the collapsed row's Overview) but the sftp browser as not (only revealed once
+    expanded) - the exact distinction Resource.immediate exists to preserve now
+    that resources() itself yields everything unconditionally."""
+    service = Ssh(kind="ssh", ip="10.0.0.5", port=22)
+
+    yielded = list(service.resources())
+
+    assert [(r.category, r.immediate) for r in yielded] == [
+        (ResourceCategory.TERMINAL, True),
+        (ResourceCategory.FILE_SHARES, False),
+    ]
+
+
+def test_ssh_enrich_device_stores_the_device_and_still_offers_its_own_alias():
+    """Verify that Ssh.enrich_device (which overrides the base Service.enrich_device
+    to also remember its owning device - see _host) still offers its own mDNS
+    instance name as an alias exactly like the base implementation does, so
+    overriding it didn't silently drop that behavior."""
+    device = DeviceFactory(ip="10.0.0.5")
+    service = Ssh(kind="ssh", ip="10.0.0.5", port=22, discovered_name="werner")
+
+    service.enrich_device(device)
+
+    assert device.names["werner"] == {"ssh"}
+
+
+def test_ssh_resources_uses_the_devices_known_hosts_name_once_attached():
+    """Verify that Ssh.resources builds its sftp browse link from the owning
+    Device's ssh_host() (a known_hosts name here) rather than the service's own
+    bare ip, once attached via Device.add_service (which calls enrich_device) -
+    the same fix as Samba's smb:// links, just for the sftp:// browse action."""
+    device = DeviceFactory(ip="10.0.0.5", names={"werner": {"ssh-known-hosts"}})
+    device.add_service("ssh", 22)
+
+    sftp = next(r.action for r in device.services["ssh"].resources()
+                if r.category == ResourceCategory.FILE_SHARES)
+
+    assert sftp.ip == "werner"
+
+
+def test_ssh_resources_falls_back_to_ip_when_never_attached_to_a_device():
+    """Verify that Ssh.resources still falls back to its own bare ip when built
+    directly rather than through Device.add_service - enrich_device never ran, so
+    there's no device to ask for a better name."""
+    service = Ssh(kind="ssh", ip="10.0.0.5", port=22)
+
+    sftp = next(r.action for r in service.resources() if r.category == ResourceCategory.FILE_SHARES)
+
+    assert sftp.ip == "10.0.0.5"
+
+
+def test_samba_share_action_builds_an_smb_uri_labeled_with_the_share_name():
+    """Verify that Samba._share_action builds an smb:// uri for the given share and
+    labels the button with the share's own name, by checking both fields on an
+    anonymous (no stored username) service."""
     service = Samba(kind="smb", ip="10.0.0.5", port=445)
-    service.shares = None
-    service.auth_required = True
 
-    resources = [r async for r in service.get_resources(expanded=True, scanner=None)]
+    action = service._share_action(SmbShare("Public"))
 
-    assert len(resources) == 1
-    assert isinstance(resources[0].action, CredentialAction)
+    assert action.uri == "smb://10.0.0.5/Public"
+    assert action.label == "Public"
 
 
-async def test_incus_get_resources_always_yields_web_admin_when_collapsed():
-    """Verify that Incus.get_resources yields a web-admin resource when collapsed
-    regardless of instance-fetch state, by checking a freshly-created service with
-    no fetch yet still yields exactly one WebAdminAction pointing at the UI root."""
+def test_samba_share_action_url_encodes_a_username_with_special_characters():
+    """Verify that a stored username containing a uri-significant character (here,
+    '@', as in a UPN-style login) is percent-encoded rather than corrupting the
+    uri's own authority/path split."""
+    service = Samba(kind="smb", ip="10.0.0.5", port=445, username="bob@example.com")
+
+    action = service._share_action(SmbShare("Public"))
+
+    assert action.uri == "smb://bob%40example.com@10.0.0.5/Public"
+
+
+def test_samba_printer_action_builds_an_smb_uri_labeled_with_the_printer_name():
+    """Verify that Samba._printer_action builds the same smb://-style uri shape as
+    _share_action, just for a printer share's name."""
+    service = Samba(kind="smb", ip="10.0.0.5", port=445, username="bob")
+
+    action = service._printer_action(SmbShare("OfficeLaser"))
+
+    assert action.uri == "smb://bob@10.0.0.5/OfficeLaser"
+    assert action.label == "OfficeLaser"
+
+
+def test_samba_enrich_device_stores_the_device_and_still_offers_its_own_alias():
+    """Verify that Samba.enrich_device (which overrides the base Service.enrich_device
+    to also remember its owning device - see _host) still offers its own mDNS
+    instance name as an alias exactly like the base implementation does, so
+    overriding it didn't silently drop that behavior."""
+    device = DeviceFactory(ip="10.0.0.5")
+    service = Samba(kind="smb", ip="10.0.0.5", port=445, discovered_name="MyNAS")
+
+    service.enrich_device(device)
+
+    assert device.names["MyNAS"] == {"smb"}
+
+
+def test_samba_share_action_uses_the_devices_wsd_name_once_attached():
+    """Verify that Samba._share_action builds its smb:// uri from the owning
+    Device's smb_host() (a wsdd name here) rather than the service's own bare ip,
+    once attached via Device.add_service (which calls enrich_device) - the actual
+    fix for smb:// links always connecting by ip even when a real name is known."""
+    device = DeviceFactory(ip="10.0.0.5", names={"NAS": {"WSD"}})
+    device.add_service("smb", 445)
+    service = device.services["smb"]
+
+    action = service._share_action(SmbShare("Public"))
+
+    assert action.uri == "smb://NAS/Public"
+
+
+def test_samba_share_action_falls_back_to_ip_when_never_attached_to_a_device():
+    """Verify that Samba._share_action still falls back to its own bare ip when
+    built directly rather than through Device.add_service (as every other
+    _share_action test here does) - enrich_device never ran, so there's no device to
+    ask for a better name."""
+    service = Samba(kind="smb", ip="10.0.0.5", port=445)
+
+    action = service._share_action(SmbShare("Public"))
+
+    assert action.uri == "smb://10.0.0.5/Public"
+
+
+def test_samba_resources_carries_the_stored_username_into_both_actions():
+    """Verify that Samba.resources passes its own remembered username through to
+    both _share_action and _printer_action, by checking each built uri embeds it -
+    the actual fix for links otherwise re-prompting for a username already given
+    once via the sign-in form."""
+    service = Samba(kind="smb", ip="10.0.0.5", port=445)
+    service.shares = [SmbShare("Public")]
+    service.printers = [SmbShare("OfficeLaser")]
+    service.username = "bob"
+
+    yielded = list(service.resources())
+
+    assert {r.action.uri for r in yielded} == {"smb://bob@10.0.0.5/Public", "smb://bob@10.0.0.5/OfficeLaser"}
+
+
+@pytest.mark.parametrize("kwargs, expected_state", [
+    ({"loading": True}, FetchState.LOADING),
+    ({}, FetchState.NOT_FETCHED),
+    ({"instances": []}, FetchState.LOADED),
+    # inaccessible (accessible=False) is still a completed fetch, not an auth
+    # prompt - Incus has no interactive retry flow the way Samba does.
+    ({"instances": [], "accessible": False}, FetchState.LOADED),
+])
+def test_incus_fetch_state_reflects_loading_and_instances(kwargs, expected_state):
+    """Verify that Incus.fetch_state derives the right FetchState from its
+    loading/instances fields, including that an inaccessible-but-fetched server
+    is LOADED, not some separate auth-required state."""
+    service = Incus(kind="incus", ip="10.0.0.5", port=8443, **kwargs)
+
+    assert service.fetch_state == expected_state
+
+
+def test_incus_resources_always_yields_the_web_admin_link_even_unfetched():
+    """Verify that Incus.resources yields a web-admin resource regardless of
+    instance-fetch state, by checking a freshly-created service with no fetch yet
+    still yields exactly one immediate LaunchAction pointing at the UI root."""
     service = Incus(kind="incus", ip="10.0.0.5", port=8443)
 
-    yielded = [r async for r in service.get_resources(expanded=False, scanner=None)]
+    yielded = list(service.resources())
 
     assert len(yielded) == 1
-    assert isinstance(yielded[0].action, WebAdminAction)
+    assert isinstance(yielded[0].action, LaunchAction)
     assert yielded[0].action.uri == "https://10.0.0.5:8443/ui/"
+    assert yielded[0].immediate is True
 
 
-async def test_incus_get_resources_requests_a_fetch_on_first_expand():
-    """Verify that expanding an Incus service with no instances fetched yet still
-    yields the general web-admin link (so the tab is never a dead end while
-    instances are loading) and requests items, by checking the fake scanner
-    recorded it."""
-    service = Incus(kind="incus", ip="10.0.0.5", port=8443)
-    scanner = FakeScanner()
-
-    yielded = [r async for r in service.get_resources(expanded=True, scanner=scanner)]
-
-    assert [r.action.label for r in yielded] == ["Incus admin"]
-    assert scanner.requested == [(service, {})]
-
-
-async def test_incus_get_resources_yields_one_console_action_per_instance():
-    """Verify that Incus.get_resources yields the general web-admin link plus an
-    IncusConsoleAction per fetched instance once populated, by setting instances
-    directly and expanding - the general link supplements per-instance links
-    rather than being replaced by them, so there's always something to click even
-    if the instance list turns out to be empty."""
+def test_incus_resources_yields_one_console_action_per_instance():
+    """Verify that Incus.resources yields the general web-admin link plus a
+    console LaunchAction per fetched instance once populated, by setting instances
+    directly - the general link supplements per-instance links rather than being
+    replaced by them, so there's always something to click even if the instance
+    list turns out to be empty."""
     service = Incus(kind="incus", ip="10.0.0.5", port=8443)
     service.instances = [IncusInstance("web", "Running"), IncusInstance("db", "Stopped")]
 
-    yielded = [r async for r in service.get_resources(expanded=True, scanner=None)]
+    yielded = list(service.resources())
 
     assert [r.action.label for r in yielded] == ["Incus admin", "web (Running)", "db (Stopped)"]
+    # The general link is immediate (visible collapsed too); per-instance
+    # consoles are not - they'd be clutter in the compact row.
+    assert [r.immediate for r in yielded] == [True, False, False]
+
+
+def test_incus_console_action_labels_with_name_and_status():
+    """Verify that Incus._console_action labels the button with the instance's name
+    and status and points at the UI root, by checking a running-instance example."""
+    service = Incus(kind="incus", ip="10.0.0.5", port=8443)
+
+    action = service._console_action(IncusInstance("web-vm", "Running"))
+
+    assert action.label == "web-vm (Running)"
+    assert action.uri == "https://10.0.0.5:8443/ui/"
 
 
 async def test_incus_fetch_marks_inaccessible_on_a_forbidden_or_malformed_response(fake_http_connection):
@@ -310,6 +540,21 @@ async def test_incus_fetch_clears_a_stale_error_once_accessible_again(fake_http_
     assert service.extra_properties() == []
 
 
+@pytest.mark.parametrize("kwargs, expected_state", [
+    ({"loading": True}, FetchState.LOADING),
+    ({}, FetchState.NOT_FETCHED),
+    ({"queues": []}, FetchState.LOADED),
+    ({"queues": ["Laser1"]}, FetchState.LOADED),
+])
+def test_cups_fetch_state_reflects_loading_and_queues(kwargs, expected_state):
+    """Verify that Cups.fetch_state derives the right FetchState from its
+    loading/queues fields, by checking every state including a genuinely empty
+    (zero-queue) successful fetch."""
+    service = Cups(kind="cups", ip="10.0.0.40", port=631, **kwargs)
+
+    assert service.fetch_state == expected_state
+
+
 @pytest.mark.parametrize("html, expected_queues", [
     (b'<a href="/printers/OfficeLaser">OfficeLaser</a>', ["OfficeLaser"]),
     (b'<A HREF="/printers/Reception">x</A> <A HREF="/printers/Reception">dup</A>', ["Reception"]),
@@ -330,56 +575,57 @@ async def test_cups_fetch_scrapes_deduplicated_queue_names_from_the_printers_pag
     assert service.queues == expected_queues
 
 
-async def test_cups_get_resources_targets_the_specific_queue_sub_path():
-    """Verify that Cups.get_resources builds a per-queue WebAdminAction pointing at
+def test_cups_resources_targets_the_specific_queue_sub_path():
+    """Verify that Cups.resources builds a per-queue LaunchAction pointing at
     /printers/{queue}, alongside the general web-admin link (see Incus's
-    equivalent test for why that's not replaced), by expanding a service with
+    equivalent test for why that's not replaced), by checking a service with
     queues already populated."""
     service = Cups(kind="cups", ip="10.0.0.40", port=631)
     service.queues = ["Laser1"]
 
-    yielded = [r async for r in service.get_resources(expanded=True, scanner=None)]
+    yielded = list(service.resources())
 
     assert len(yielded) == 2
     assert yielded[-1].action.uri == "http://10.0.0.40:631/printers/Laser1"
+    # The general link is immediate (visible collapsed too); the per-queue link
+    # is not - same reasoning as Incus's per-instance consoles.
+    assert [r.immediate for r in yielded] == [True, False]
 
 
-async def test_ipp_get_resources_prefers_the_advertised_adminurl():
-    """Verify that Ipp.get_resources uses the adminurl txt record verbatim when
+def test_ipp_resources_prefers_the_advertised_adminurl():
+    """Verify that Ipp.resources uses the adminurl txt record verbatim when
     present instead of guessing a port-80 fallback, by checking the built action's
     uri matches the txt record exactly."""
     service = Ipp(kind="ipp", ip="10.0.0.30", port=631,
                   properties={b"adminurl": b"http://10.0.0.30/hp/device/index.html"})
 
-    yielded = [r async for r in service.get_resources(expanded=False, scanner=None)]
+    yielded = list(service.resources())
 
     assert yielded[0].action.uri == "http://10.0.0.30/hp/device/index.html"
 
 
-async def test_ipp_get_resources_falls_back_to_port_80_without_an_adminurl():
-    """Verify that Ipp.get_resources falls back to port 80 on the service's own IP
+def test_ipp_resources_falls_back_to_port_80_without_an_adminurl():
+    """Verify that Ipp.resources falls back to port 80 on the service's own IP
     when no adminurl txt record is present, by checking the built action's uri."""
     service = Ipp(kind="ipp", ip="10.0.0.31", port=631, properties={})
 
-    yielded = [r async for r in service.get_resources(expanded=False, scanner=None)]
+    yielded = list(service.resources())
 
     assert yielded[0].action.uri == "http://10.0.0.31:80/"
 
 
-async def test_ipp_get_resources_yields_the_same_resource_regardless_of_expanded():
-    """Verify that Ipp.get_resources ignores expanded and yields the same admin-page
-    resource either way. ipp has no deeper, per-resource content to reveal once
-    expanded (unlike smb/incus/cups), so its Printers tab must keep showing the same
-    resource Overview does - a dead, actionless tab would be a regression for a
-    service that plainly has one resource available. Regression test: this used to
-    return nothing once expanded=True, leaving a dead label in the Printers tab."""
+def test_ipp_resources_yields_exactly_one_immediate_resource():
+    """Verify that Ipp.resources always yields exactly one, immediate resource -
+    ipp has no deeper, per-resource content to reveal once expanded (unlike
+    smb/incus/cups), so its Printers tab must keep showing the same resource
+    Overview does; a dead, actionless tab would be a regression for a service
+    that plainly has one resource available."""
     service = Ipp(kind="ipp", ip="10.0.0.31", port=631, properties={})
 
-    collapsed = [r async for r in service.get_resources(expanded=False, scanner=None)]
-    expanded = [r async for r in service.get_resources(expanded=True, scanner=None)]
+    yielded = list(service.resources())
 
-    assert len(expanded) == 1
-    assert expanded[0].action.uri == collapsed[0].action.uri
+    assert len(yielded) == 1
+    assert yielded[0].immediate is True
 
 
 def test_ipp_enrich_device_adds_ty_and_note_as_aliases_not_primary():

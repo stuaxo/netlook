@@ -1,31 +1,8 @@
 """Unit tests for netlook.core.actions."""
-from dataclasses import dataclass
-
 import pytest
 
 from netlook.core import actions
-from netlook.core.actions import (
-    CredentialAction,
-    IncusConsoleAction,
-    RemoteSessionAction,
-    ShareAction,
-    SftpBrowseAction,
-    WebAdminAction,
-    display_name,
-)
-from netlook.core.services import IncusInstance, SmbShare
-
-from doubles import FakeScanner
-
-
-@dataclass
-class _FakeService:
-    """A minimal stand-in for core.models.Service - just the attributes Action
-    factories actually read. Using this instead of the real dataclass proves
-    actions.py's claim that it has no runtime dependency on models.py."""
-    kind: str
-    ip: str
-    port: int
+from netlook.core.actions import LaunchAction, SftpBrowseAction, display_name
 
 
 @pytest.mark.parametrize("kind, expected", [
@@ -43,74 +20,86 @@ def test_display_name_maps_known_kinds_and_titlecases_unknown_ones(kind, expecte
     assert result == expected
 
 
-def test_remote_session_action_from_service_builds_a_scheme_uri_and_readable_label():
-    """Verify that RemoteSessionAction.from_service builds a scheme://ip:port uri and
-    a human-readable label, by checking both against an ssh-kind fake service."""
-    service = _FakeService(kind="ssh", ip="10.0.0.5", port=22)
-
-    action = RemoteSessionAction.from_service(service)
-
-    assert action.uri == "ssh://10.0.0.5:22"
-    assert action.label == "Secure Shell (SSH)"
-
-
-async def test_remote_session_action_run_prefers_remmina_when_installed(monkeypatch, popen_calls):
-    """Verify that RemoteSessionAction.run launches via remmina when it's installed,
-    by monkeypatching HAS_REMMINA True and checking the resulting Popen command."""
+async def test_launch_action_run_prefers_remmina_when_opener_is_remmina_and_installed(monkeypatch, popen_calls):
+    """Verify that LaunchAction.run launches via remmina when opener="remmina" and
+    remmina is installed, by monkeypatching HAS_REMMINA True and checking the
+    resulting Popen command."""
     monkeypatch.setattr(actions, "HAS_REMMINA", True)
-    action = RemoteSessionAction(label="ssh", uri="ssh://10.0.0.5:22")
+    action = LaunchAction(label="ssh", uri="ssh://10.0.0.5:22", opener="remmina")
 
     await action.run(scanner=None)
 
     assert popen_calls == [["remmina", "-c", "ssh://10.0.0.5:22"]]
 
 
-async def test_remote_session_action_run_falls_back_to_xdg_open_without_remmina(monkeypatch, popen_calls):
-    """Verify that RemoteSessionAction.run falls back to xdg-open when remmina isn't
-    installed, by monkeypatching HAS_REMMINA False and checking the Popen command."""
+async def test_launch_action_run_falls_back_to_xdg_open_without_remmina(monkeypatch, popen_calls):
+    """Verify that LaunchAction.run falls back to xdg-open when opener="remmina" but
+    remmina isn't installed, by monkeypatching HAS_REMMINA False and checking the
+    Popen command."""
     monkeypatch.setattr(actions, "HAS_REMMINA", False)
-    action = RemoteSessionAction(label="ssh", uri="ssh://10.0.0.5:22")
+    action = LaunchAction(label="ssh", uri="ssh://10.0.0.5:22", opener="remmina")
 
     await action.run(scanner=None)
 
     assert popen_calls == [["xdg-open", "ssh://10.0.0.5:22"]]
 
 
-@pytest.mark.parametrize("port_override, expected_port", [
-    (None, 8443),    # falls back to the service's own detected port
-    (47990, 47990),  # explicit override, e.g. Sunshine's config UI
-])
-def test_web_admin_action_from_service_honors_the_port_override(port_override, expected_port):
-    """Verify that WebAdminAction.from_service uses the service's own port unless an
-    explicit override is given, by comparing the built uri's port for both cases."""
-    service = _FakeService(kind="incus", ip="10.0.0.5", port=8443)
+async def test_launch_action_run_uses_xdg_open_for_the_default_opener_even_with_remmina_installed(
+    monkeypatch, popen_calls,
+):
+    """Verify that LaunchAction.run only ever prefers remmina for opener="remmina" -
+    the default opener ("xdg-open", used by every non-remote-session builder) should
+    never launch remmina even when it's installed."""
+    monkeypatch.setattr(actions, "HAS_REMMINA", True)
+    action = LaunchAction(label="Incus admin", uri="https://10.0.0.5:8443/ui/")
 
-    action = WebAdminAction.from_service(service, path="/ui/", scheme="https", port=port_override)
+    await action.run(scanner=None)
 
-    assert action.uri == f"https://10.0.0.5:{expected_port}/ui/"
-
-
-def test_share_action_from_resource_builds_an_smb_uri_labeled_with_the_share_name():
-    """Verify that ShareAction.from_resource builds an smb:// uri for the given
-    share and labels the button with the share's own name, by checking both fields."""
-    service = _FakeService(kind="smb", ip="10.0.0.5", port=445)
-
-    action = ShareAction.from_resource(service, SmbShare("Public"))
-
-    assert action.uri == "smb://10.0.0.5/Public"
-    assert action.label == "Public"
+    assert popen_calls == [["xdg-open", "https://10.0.0.5:8443/ui/"]]
 
 
-def test_incus_console_action_from_resource_labels_with_name_and_status():
-    """Verify that IncusConsoleAction.from_resource labels the button with the
-    instance's name and status, by checking a running-instance example."""
-    service = _FakeService(kind="incus", ip="10.0.0.5", port=8443)
-    instance = IncusInstance("web-vm", "Running")
+async def test_launch_action_run_uses_gtk_launch_for_smb_uris_when_gio_open_is_the_handler(
+    monkeypatch, popen_calls,
+):
+    """Verify that LaunchAction.run routes smb:// shares through gtk-launch with the
+    default inode/directory handler when xdg-open would resolve to gio open - gio open
+    can't open a share that GVfs hasn't mounted yet, but the file manager mounts it on
+    demand when launched directly with the uri."""
+    monkeypatch.setattr(actions, "_uses_gio_open", lambda: True)
+    monkeypatch.setattr(actions, "_default_file_manager", lambda: "org.gnome.Nautilus.desktop")
+    action = LaunchAction(label="stuff", uri="smb://10.0.0.5/stuff")
 
-    action = IncusConsoleAction.from_resource(service, instance)
+    await action.run(scanner=None)
 
-    assert action.label == "web-vm (Running)"
-    assert action.uri == "https://10.0.0.5:8443/ui/"
+    assert popen_calls == [["gtk-launch", "org.gnome.Nautilus.desktop", "smb://10.0.0.5/stuff"]]
+
+
+async def test_launch_action_run_uses_xdg_open_for_smb_uris_when_gio_open_is_not_the_handler(
+    monkeypatch, popen_calls,
+):
+    """Verify that LaunchAction.run falls back to plain xdg-open for smb:// shares on
+    desktops (e.g. KDE) whose xdg-open doesn't route through gio open."""
+    monkeypatch.setattr(actions, "_uses_gio_open", lambda: False)
+    action = LaunchAction(label="stuff", uri="smb://10.0.0.5/stuff")
+
+    await action.run(scanner=None)
+
+    assert popen_calls == [["xdg-open", "smb://10.0.0.5/stuff"]]
+
+
+async def test_launch_action_run_falls_back_to_xdg_open_when_no_default_file_manager_is_registered(
+    monkeypatch, popen_calls,
+):
+    """Verify that LaunchAction.run falls back to xdg-open for an smb:// share even
+    when gio open is the handler, if xdg-mime has no inode/directory default to
+    gtk-launch."""
+    monkeypatch.setattr(actions, "_uses_gio_open", lambda: True)
+    monkeypatch.setattr(actions, "_default_file_manager", lambda: None)
+    action = LaunchAction(label="stuff", uri="smb://10.0.0.5/stuff")
+
+    await action.run(scanner=None)
+
+    assert popen_calls == [["xdg-open", "smb://10.0.0.5/stuff"]]
 
 
 @pytest.mark.parametrize("user, path, port, expected_uri", [
@@ -119,10 +108,15 @@ def test_incus_console_action_from_resource_labels_with_name_and_status():
     ("bob", "srv", 2222, "sftp://bob@10.0.0.5:2222/srv"),
     ("", "  /data  ", 22, "sftp://10.0.0.5/data"),
 ])
-async def test_sftp_browse_action_run_normalizes_user_path_and_port(popen_calls, user, path, port, expected_uri):
+async def test_sftp_browse_action_run_normalizes_user_path_and_port(
+    monkeypatch, popen_calls, user, path, port, expected_uri,
+):
     """Verify that SftpBrowseAction.run builds a correct sftp:// uri across
     combinations of user/path/port, by checking it adds a leading slash to a bare
-    path, omits the default port 22, and strips surrounding whitespace."""
+    path, omits the default port 22, and strips surrounding whitespace. Pinned to
+    the plain-xdg-open path (see the gio-open tests below for the other branch) so
+    this test's own assertion is only about uri-building, not opener selection."""
+    monkeypatch.setattr(actions, "_uses_gio_open", lambda: False)
     action = SftpBrowseAction(ip="10.0.0.5", port=port)
 
     await action.run(scanner=None, user=user, path=path)
@@ -130,13 +124,26 @@ async def test_sftp_browse_action_run_normalizes_user_path_and_port(popen_calls,
     assert popen_calls == [["xdg-open", expected_uri]]
 
 
-async def test_credential_action_run_re_queries_the_owning_service_via_scanner():
-    """Verify that CredentialAction.run calls scanner.request_items with the trimmed
-    username and the owning service, by capturing the call on a fake scanner."""
-    service = _FakeService(kind="smb", ip="10.0.0.5", port=445)
-    action = CredentialAction.from_service(service)
-    scanner = FakeScanner()
+async def test_sftp_browse_action_run_uses_gtk_launch_when_gio_open_is_the_handler(monkeypatch, popen_calls):
+    """Verify that SftpBrowseAction.run, like LaunchAction's smb:// shares, routes
+    through gtk-launch with the default inode/directory handler when xdg-open would
+    resolve to gio open - gio open can't open an sftp:// location GVfs hasn't
+    mounted yet either, the same bug smb:// shares hit (see _open_directory)."""
+    monkeypatch.setattr(actions, "_uses_gio_open", lambda: True)
+    monkeypatch.setattr(actions, "_default_file_manager", lambda: "org.gnome.Nautilus.desktop")
+    action = SftpBrowseAction(ip="10.0.0.5", port=22)
 
-    await action.run(scanner, user="  bob  ", password="secret")
+    await action.run(scanner=None, user="bob", path="/data")
 
-    assert scanner.requested == [(service, {"user": "bob", "password": "secret"})]
+    assert popen_calls == [["gtk-launch", "org.gnome.Nautilus.desktop", "sftp://bob@10.0.0.5/data"]]
+
+
+async def test_sftp_browse_action_run_uses_xdg_open_when_gio_open_is_not_the_handler(monkeypatch, popen_calls):
+    """Verify that SftpBrowseAction.run falls back to plain xdg-open on a desktop
+    (e.g. KDE) whose xdg-open doesn't route through gio open."""
+    monkeypatch.setattr(actions, "_uses_gio_open", lambda: False)
+    action = SftpBrowseAction(ip="10.0.0.5", port=22)
+
+    await action.run(scanner=None, user="bob", path="/data")
+
+    assert popen_calls == [["xdg-open", "sftp://bob@10.0.0.5/data"]]

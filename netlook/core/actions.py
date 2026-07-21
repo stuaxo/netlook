@@ -10,18 +10,41 @@ and executed with nothing else from the package - a CLI or test could do the sam
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .models import Service
     from .scanner import NetworkScanner
-    from .services import IncusInstance, SmbShare
 
 HAS_REMMINA = shutil.which("remmina") is not None
-SESSION_SCHEMES = {"ssh": "ssh", "rdp": "rdp", "vnc": "vnc"}
+
+
+def _uses_gio_open() -> bool:
+    """Whether plain `xdg-open` will end up shelling out to `gio open` on this
+    desktop. Per /usr/bin/xdg-open's open_gnome/open_gnome3/open_mate/
+    open_xfce/open_generic fallbacks, that's every desktop except KDE and
+    Cinnamon (which have their own scheme-aware openers, kde-open/nemo, that
+    don't share gio's unmounted-share bug)."""
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "")
+    if any(name in desktop for name in ("KDE", "Cinnamon")):
+        return False
+    return shutil.which("gio") is not None
+
+
+def _default_file_manager() -> str | None:
+    """The .desktop id xdg-mime has registered for inode/directory (e.g.
+    "org.gnome.Nautilus.desktop"), for launching it directly via gtk-launch."""
+    try:
+        result = subprocess.run(
+            ["xdg-mime", "query", "default", "inode/directory"],
+            capture_output=True, text=True, check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
 
 # service kind -> human-readable protocol name for row/button labels, e.g. "Secure
 # Shell (SSH)" instead of a bare "ssh". Lives here (not models.py/services.py) so
@@ -33,10 +56,10 @@ PROTOCOL_NAMES = {
     "vnc": "Screen Sharing (VNC)",
     # These four are raw protocol acronyms most users won't recognize on sight -
     # named after what they actually are, not just the technical protocol, the
-    # same idea as the Printers tab's "Printer admin" wording (see WebAdminAction
-    # call sites in services.py, which already override cups/ipp/ipps's action
-    # label separately - renaming these here only changes the category tab's
-    # entry header, not any button text).
+    # same idea as the Printers tab's "Printer admin" wording (see
+    # web_admin_action call sites in services.py, which already override
+    # cups/ipp/ipps's action label separately - renaming these here only changes
+    # the category tab's entry header, not any button text).
     "smb": "Windows file share (SMB)",
     "cups": "Print server (CUPS)",
     "ipp": "Network printer (IPP)",
@@ -67,102 +90,55 @@ class Action:
     fields: tuple[str, ...] = ()  # names of text inputs the UI must collect before run()
 
     async def run(self, scanner: "NetworkScanner", **kwargs) -> None:
-        """`scanner` is an explicit context reference, not a global - actions that
-        don't need it (most of them: they just launch an external app, a plain
-        synchronous call even though this method is async) ignore it; actions that
-        do (CredentialAction) await it to kick off a background fetch."""
+        """`scanner` is an explicit context reference, not a global - every
+        concrete Action here just launches an external app (a plain synchronous
+        call even though this method is async), so none of them actually need it
+        today; kept on the signature since a future input-driven Action might."""
         raise NotImplementedError
 
     @staticmethod
     def _popen(cmd: list[str]) -> None:
+        print(f"Launching: {' '.join(cmd)}")
         try:
             subprocess.Popen(cmd)
         except FileNotFoundError:
             print(f"Can't run {cmd[0]}: not found")
 
-
-@dataclass
-class RemoteSessionAction(Action):
-    """Opens a terminal/remote-desktop session, via remmina if it's installed."""
-    uri: str = ""
-
-    @classmethod
-    def from_service(cls, service: "Service") -> "RemoteSessionAction":
-        uri = f"{SESSION_SCHEMES[service.kind]}://{service.ip}:{service.port}"
-        return cls(label=display_name(service.kind), uri=uri)
-
-    async def run(self, scanner: "NetworkScanner") -> None:
-        cmd = ["remmina", "-c", self.uri] if HAS_REMMINA else ["xdg-open", self.uri]
-        self._popen(cmd)
-
-
-@dataclass
-class WebAdminAction(Action):
-    """Opens a service's web admin page in the default browser."""
-    uri: str = ""
-
-    @classmethod
-    def from_service(cls, service: "Service", path: str = "/", scheme: str = "http",
-                      port: int | None = None, label: str | None = None) -> "WebAdminAction":
-        # port: override for admin UIs that live on a different port than the one the
-        # service was detected on (e.g. Sunshine's config UI vs. its GameStream port).
-        # label: override for the default "{protocol name} admin" - a bare
-        # protocol name (e.g. "Printing (IPP)") names *what this is*, not *what
-        # clicking it does*; "X admin" says both. Some kinds read better with a
-        # name other than their own protocol name here (ipp/cups both say
-        # "Printer admin", not "Printing (IPP) admin"/"Printing (CUPS) admin" - the
-        # protocol is an implementation detail the user doesn't need to see here).
-        return cls(label=label or f"{display_name(service.kind)} admin",
-                    uri=f"{scheme}://{service.ip}:{port or service.port}{path}")
-
-    async def run(self, scanner: "NetworkScanner") -> None:
-        self._popen(["xdg-open", self.uri])
+    def _open_directory(self, uri: str) -> None:
+        """Opens a GVfs directory uri (smb://, sftp://) via xdg-open, working around
+        gio open's inability to open one that GVfs hasn't already mounted (see
+        _uses_gio_open) by launching the default file manager directly instead - it
+        mounts on demand when given the uri directly, unlike gio open. Shared by
+        every Action that opens this kind of uri (LaunchAction's smb:// shares,
+        SftpBrowseAction) rather than each re-implementing the same workaround."""
+        if _uses_gio_open():
+            file_manager = _default_file_manager()
+            if file_manager:
+                self._popen(["gtk-launch", file_manager, uri])
+                return
+        self._popen(["xdg-open", uri])
 
 
 @dataclass
-class ShareAction(Action):
-    """Opens one smb share in the system file manager."""
+class LaunchAction(Action):
+    """Opens a uri via the system's default handler (xdg-open), or via remmina
+    (if installed) for a remote-session launch. Replaces what used to be five
+    near-identical Action subclasses (RemoteSessionAction, WebAdminAction,
+    ShareAction, SmbPrinterAction, IncusConsoleAction) that differed only in
+    how their uri got built, never in how they ran - that construction now
+    lives with whichever Service subclass owns the relevant knowledge
+    (services.py), or, for the couple of builders shared across several
+    unrelated kinds, as free functions in models.py."""
     uri: str = ""
-
-    @classmethod
-    def from_resource(cls, service: "Service", share: "SmbShare") -> "ShareAction":
-        return cls(label=share.name, uri=f"smb://{service.ip}/{share.name}")
+    opener: str = "xdg-open"  # "remmina" for remote-session launches (ssh/rdp/vnc)
 
     async def run(self, scanner: "NetworkScanner") -> None:
-        self._popen(["xdg-open", self.uri])
-
-
-@dataclass
-class SmbPrinterAction(Action):
-    """A basic placeholder for an SMB-shared printer resource. Unlike a file share,
-    there's no single standard "open" action for a network printer - most desktops
-    resolve one through their own Add Printer/CUPS dialog, not a URI a browser or
-    file manager can act on directly. This reuses the same smb:// address a file
-    share would use, since some file managers can still browse/resolve it; treat it
-    as a starting point to build on, not a finished "connect me" flow."""
-    uri: str = ""
-
-    @classmethod
-    def from_resource(cls, service: "Service", printer: "SmbShare") -> "SmbPrinterAction":
-        return cls(label=printer.name, uri=f"smb://{service.ip}/{printer.name}")
-
-    async def run(self, scanner: "NetworkScanner") -> None:
-        self._popen(["xdg-open", self.uri])
-
-
-@dataclass
-class IncusConsoleAction(Action):
-    """Opens the incus web UI for one instance."""
-    uri: str = ""
-
-    @classmethod
-    def from_resource(cls, service: "Service", instance: "IncusInstance") -> "IncusConsoleAction":
-        # incus's web UI has no stable per-instance deep link across versions, so this
-        # just opens the UI root - the label at least tells you what to look for.
-        uri = f"https://{service.ip}:{service.port}/ui/"
-        return cls(label=f"{instance.name} ({instance.status})", uri=uri)
-
-    async def run(self, scanner: "NetworkScanner") -> None:
+        if self.opener == "remmina" and HAS_REMMINA:
+            self._popen(["remmina", "-c", self.uri])
+            return
+        if self.uri.startswith("smb://"):
+            self._open_directory(self.uri)
+            return
         self._popen(["xdg-open", self.uri])
 
 
@@ -174,10 +150,6 @@ class SftpBrowseAction(Action):
     ip: str = ""
     port: int = 22
 
-    @classmethod
-    def from_service(cls, service: "Service") -> "SftpBrowseAction":
-        return cls(ip=service.ip, port=service.port)
-
     async def run(self, scanner: "NetworkScanner", user: str = "", path: str = "") -> None:
         user = user.strip()
         path = path.strip()
@@ -185,21 +157,4 @@ class SftpBrowseAction(Action):
             path = f"/{path}"
         auth = f"{user}@" if user else ""
         port_part = f":{self.port}" if self.port != 22 else ""
-        self._popen(["xdg-open", f"sftp://{auth}{self.ip}{port_part}{path}"])
-
-
-@dataclass
-class CredentialAction(Action):
-    """Not a launch - submitting it re-queries the owning service with credentials,
-    via the scanner passed into run() rather than a module-level global."""
-    label: str = "sign in"
-    fields: tuple[str, ...] = ("user", "password")
-    service: "Service | None" = None
-    failed: bool = False
-
-    @classmethod
-    def from_service(cls, service: "Service", failed: bool = False) -> "CredentialAction":
-        return cls(service=service, failed=failed)
-
-    async def run(self, scanner: "NetworkScanner", user: str = "", password: str = "") -> None:
-        await scanner.request_items(self.service, user=user.strip(), password=password)
+        self._open_directory(f"sftp://{auth}{self.ip}{port_part}{path}")

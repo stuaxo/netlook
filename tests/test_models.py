@@ -8,6 +8,8 @@ from netlook.core.models import (
     kind_from_type,
     make_service,
     register,
+    remote_session_action,
+    web_admin_action,
 )
 
 
@@ -81,40 +83,67 @@ def test_service_enrich_device_is_a_noop_without_a_discovered_name():
     assert device.names == {"seed": {"seed-source"}}
 
 
+def test_remote_session_action_builds_a_scheme_uri_and_readable_label():
+    """Verify that remote_session_action builds a scheme://ip:port uri, a
+    human-readable label, and prefers remmina, by checking all three against an
+    ssh-kind service."""
+    service = Service(kind="ssh", ip="10.0.0.5", port=22)
+
+    action = remote_session_action(service)
+
+    assert action.uri == "ssh://10.0.0.5:22"
+    assert action.label == "Secure Shell (SSH)"
+    assert action.opener == "remmina"
+
+
+@pytest.mark.parametrize("port_override, expected_port", [
+    (None, 8443),    # falls back to the service's own detected port
+    (47990, 47990),  # explicit override, e.g. Sunshine's config UI
+])
+def test_web_admin_action_honors_the_port_override(port_override, expected_port):
+    """Verify that web_admin_action uses the service's own port unless an explicit
+    override is given, and defaults to the xdg-open opener, by comparing the built
+    uri's port for both cases."""
+    service = Service(kind="incus", ip="10.0.0.5", port=8443)
+
+    action = web_admin_action(service, path="/ui/", scheme="https", port=port_override)
+
+    assert action.uri == f"https://10.0.0.5:{expected_port}/ui/"
+    assert action.opener == "xdg-open"
+
+
 @pytest.mark.parametrize("kind, expected_labels", [
     ("rdp", ["Remote Desktop (RDP)"]),
     ("vnc", ["Screen Sharing (VNC)"]),
     ("home-assistant", ["Home Assistant admin"]),
     ("hue", []),  # not in LAUNCH_KINDS or WEB_ADMIN - no default action
 ])
-async def test_base_service_get_resources_covers_launch_and_web_admin_kinds(kind, expected_labels):
-    """Verify that the base Service.get_resources yields a launch resource for
+def test_base_service_resources_covers_launch_and_web_admin_kinds(kind, expected_labels):
+    """Verify that the base Service.resources yields a launch resource for
     LAUNCH_KINDS, a web-admin resource for WEB_ADMIN kinds, and nothing for any
     other kind, by comparing yielded action labels across a few representative
     kinds."""
     service = Service(kind=kind, ip="10.0.0.5", port=1234)
 
-    labels = [r.action.label async for r in service.get_resources(expanded=False, scanner=None)]
+    labels = [r.action.label for r in service.resources()]
 
     assert labels == expected_labels
 
 
-async def test_base_service_get_resources_yields_the_same_resource_regardless_of_expanded():
-    """Verify that the base Service.get_resources ignores expanded and yields the
-    same resource either way, by checking a LAUNCH_KINDS service's resource is
-    identical collapsed and expanded. The base class has no deeper, per-resource
-    content to reveal once expanded (unlike smb/incus/cups, which register their
-    own subclass specifically because they do), so its category tab must keep
-    showing the same resource Overview does - a dead, actionless tab would be a
-    regression, not a simplification, for a service that plainly has something to
-    click."""
+def test_base_service_resources_marks_its_one_resource_as_immediate():
+    """Verify that the base Service.resources tags its resource as immediate
+    (visible in the collapsed row), by checking a LAUNCH_KINDS service. The base
+    class has no deeper, per-resource content to reveal once expanded (unlike
+    smb/incus/cups, which register their own subclass specifically because they
+    do), so its category tab must keep showing the same resource Overview does -
+    a dead, actionless tab would be a regression, not a simplification, for a
+    service that plainly has something to click."""
     service = Service(kind="rdp", ip="10.0.0.5", port=3389)
 
-    collapsed = [r async for r in service.get_resources(expanded=False, scanner=None)]
-    expanded = [r async for r in service.get_resources(expanded=True, scanner=None)]
+    resources = list(service.resources())
 
-    assert len(expanded) == 1
-    assert expanded == collapsed
+    assert len(resources) == 1
+    assert resources[0].immediate is True
 
 
 def test_device_add_service_creates_a_service_and_enriches_only_once():
@@ -177,6 +206,161 @@ def test_aliases_excludes_only_the_current_primary_name():
     device.promote_name("device-info", "Stuart's NAS")
 
     assert device.aliases == {"MyNAS": {"smb"}, "MyNAS-ssh": {"ssh"}}
+
+
+def test_smb_host_prefers_an_mdns_name_over_a_wsd_name_and_addresses():
+    """Verify that Device.smb_host picks an mDNS-sourced name (suffixed with
+    ".local" - see the ".local" test below) ahead of a WSD (wsdd) name and both
+    address fallbacks, regardless of insertion order."""
+    device = Device("MyNAS", "10.0.0.5", ipv6="fe80::1",
+                     names={"MYNAS-wsd": {"WSD"}, "MyNAS": {"smb"}})
+
+    assert device.smb_host() == "MyNAS.local"
+
+
+def test_smb_host_appends_dot_local_to_a_bare_mdns_name():
+    """Verify that Device.smb_host suffixes a bare (undotted) mDNS-sourced name
+    with ".local" - glibc's nss-mdns (mdns4_minimal) only intercepts a lookup
+    that's actually suffixed with ".local"; a bare NetBIOS-style lookup falls
+    through to WINS/broadcast resolution instead, which failed to resolve a real
+    device's mDNS name ("werner") until ".local" was added by hand."""
+    device = Device("werner", "10.0.0.5", names={"werner": {"smb"}})
+
+    assert device.smb_host() == "werner.local"
+
+
+def test_smb_host_leaves_an_already_dotted_mdns_name_alone():
+    """Verify that Device.smb_host doesn't double-suffix an mDNS name that's
+    already dotted (e.g. already ends in .local, or is some other FQDN)."""
+    device = Device("nas.local", "10.0.0.5", names={"nas.local": {"smb"}})
+
+    assert device.smb_host() == "nas.local"
+
+
+def test_smb_host_falls_back_to_a_wsd_name_without_an_mdns_name():
+    """Verify that Device.smb_host uses a WSD-sourced name when no mDNS name was
+    ever reported."""
+    device = Device("MyNAS", "10.0.0.5", ipv6="fe80::1", names={"MyNAS": {"WSD"}})
+
+    assert device.smb_host() == "MyNAS"
+
+
+def test_smb_host_skips_ssh_known_hosts_and_etc_hosts_names():
+    """Verify that Device.smb_host doesn't treat a name sourced only from
+    ssh-known-hosts/etc-hosts as an mDNS name - those aren't reliably the device's
+    real network-resolvable name the way an mDNS or WSD name is - falling through to
+    the address fallbacks instead."""
+    device = Device("nas", "10.0.0.5", ipv6="fe80::1",
+                     names={"nas": {"ssh-known-hosts", "etc-hosts"}})
+
+    assert device.smb_host() == "fe80::1"
+
+
+def test_smb_host_prefers_ipv6_over_ipv4_without_any_name():
+    """Verify that Device.smb_host falls back to ipv6 before ipv4 when no naming
+    source has reported anything at all."""
+    device = Device("10.0.0.5", "10.0.0.5", ipv6="fe80::1")
+
+    assert device.smb_host() == "fe80::1"
+
+
+def test_smb_host_falls_back_to_ipv4_as_a_last_resort():
+    """Verify that Device.smb_host falls back to the plain ipv4 address when there's
+    no name and no ipv6 address either."""
+    device = Device("10.0.0.5", "10.0.0.5")
+
+    assert device.smb_host() == "10.0.0.5"
+
+
+@pytest.mark.parametrize("name", ["Stuart's NAS", "Stuart's PC (office)", "living room, tv", "nas 01", "café"])
+def test_smb_host_skips_an_mdns_name_that_isnt_a_valid_hostname(name):
+    """Verify that Device.smb_host never returns an mDNS-sourced name containing a
+    space, apostrophe, or other character invalid in a hostname - a human-friendly
+    display label there (e.g. "Stuart's NAS") is exactly what used to get handed
+    straight to GVfs as an smb:// uri authority, which rejects it outright
+    ("invalid argument") since it isn't valid uri/hostname syntax at all, not
+    something percent-encoding could fix - falling through to the address
+    fallbacks instead."""
+    device = Device(name, "10.0.0.5", names={name: {"smb"}})
+
+    assert device.smb_host() == "10.0.0.5"
+
+
+def test_smb_host_falls_through_a_bad_mdns_name_to_a_valid_wsd_name():
+    """Verify that Device.smb_host tries the WSD tier when the only mDNS name isn't
+    hostname-shaped, rather than giving up straight to an address - a bad name in
+    one tier shouldn't skip past a good name in the next."""
+    device = Device("Stuart's NAS", "10.0.0.5", names={"Stuart's NAS": {"smb"}, "nas01": {"WSD"}})
+
+    assert device.smb_host() == "nas01"
+
+
+@pytest.mark.parametrize("name", ["Stuart's NAS", "office printer share", "nas,01"])
+def test_smb_host_skips_a_wsd_name_that_isnt_a_valid_hostname(name):
+    """Verify that Device.smb_host applies the same hostname-shape check to a
+    WSD-sourced name as it does to an mDNS one, falling back to an address rather
+    than an unusable display name."""
+    device = Device(name, "10.0.0.5", names={name: {"WSD"}})
+
+    assert device.smb_host() == "10.0.0.5"
+
+
+def test_ssh_host_prefers_a_known_hosts_name_over_etc_hosts_mdns_and_addresses():
+    """Verify that Device.ssh_host picks a name sourced from ~/.ssh/known_hosts
+    ahead of everything else - specifically so connecting here matches whatever
+    name/form ssh itself already trusts for this host, avoiding a host-key
+    mismatch prompt for what's really the same server under a different name."""
+    device = Device("werner", "10.0.0.5", ipv6="fe80::1", names={
+        "werner": {"ssh-known-hosts"}, "werner-hosts": {"etc-hosts"}, "werner.local": {"ssh"},
+    })
+
+    assert device.ssh_host() == "werner"
+
+
+def test_ssh_host_falls_back_to_an_etc_hosts_name_without_a_known_hosts_name():
+    """Verify that Device.ssh_host uses an /etc/hosts-sourced name ahead of an mDNS
+    name and the address fallbacks when no known_hosts name was reported."""
+    device = Device("werner", "10.0.0.5", ipv6="fe80::1",
+                     names={"werner-hosts": {"etc-hosts"}, "werner": {"ssh"}})
+
+    assert device.ssh_host() == "werner-hosts"
+
+
+def test_ssh_host_falls_back_to_an_mdns_name_suffixed_with_dot_local():
+    """Verify that Device.ssh_host falls back to an mDNS-sourced name, suffixed
+    with ".local" the same way smb_host does (see _first_name), when neither
+    known_hosts nor /etc/hosts named this device."""
+    device = Device("werner", "10.0.0.5", ipv6="fe80::1", names={"werner": {"ssh"}})
+
+    assert device.ssh_host() == "werner.local"
+
+
+def test_ssh_host_falls_back_to_ipv6_then_ipv4_without_any_name():
+    """Verify that Device.ssh_host falls back to ipv6 before ipv4 when no naming
+    source has reported anything at all - same address-fallback order as
+    smb_host."""
+    assert Device("10.0.0.5", "10.0.0.5", ipv6="fe80::1").ssh_host() == "fe80::1"
+    assert Device("10.0.0.5", "10.0.0.5").ssh_host() == "10.0.0.5"
+
+
+def test_ssh_host_skips_a_known_hosts_name_that_isnt_a_valid_hostname():
+    """Verify that Device.ssh_host applies the same hostname-shape check to a
+    known_hosts name as smb_host applies to its own tiers, falling through to the
+    next tier rather than returning something unusable - known_hosts entries are
+    ordinarily always valid, but this guards the same way regardless."""
+    device = Device("we rner", "10.0.0.5", names={"we rner": {"ssh-known-hosts"}, "werner": {"etc-hosts"}})
+
+    assert device.ssh_host() == "werner"
+
+
+@pytest.mark.parametrize("name", ["nas01", "nas-01.local", "NAS", "n1"])
+def test_smb_host_accepts_ordinary_hostname_shaped_names(name):
+    """Verify that Device.smb_host's hostname check isn't overly strict - plain
+    alphanumeric names, hyphens, and dot-separated labels (the actual common case)
+    are all accepted as-is."""
+    device = Device(name, "10.0.0.5", names={name: {"WSD"}})
+
+    assert device.smb_host() == name
 
 
 def test_service_category_definition_order_is_the_ui_tab_order():

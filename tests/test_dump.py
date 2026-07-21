@@ -2,7 +2,7 @@
 import json
 
 from netlook.core.models import Device
-from netlook.core.services import Incus
+from netlook.core.services import Incus, Samba
 from netlook.dump import dump
 
 
@@ -43,6 +43,26 @@ async def test_dump_captures_a_lazily_fetched_services_data(net_scanner, tmp_pat
     vm_tab = next(t for t in olive["category_tabs"] if t["category"] == "Virtual Machines")
     action_labels = {a["label"] for e in vm_tab["entries"] for a in e["actions"]}
     assert "web (Running)" in action_labels
+
+
+async def test_dump_captures_login_fields_for_a_service_needing_credentials(net_scanner, tmp_path):
+    """Verify that dump() serializes an AUTH_REQUIRED service's login_fields
+    rather than triggering another anonymous fetch or emitting a fake action -
+    --dump has no way to supply credentials interactively, so this is the correct
+    terminal state for it to report."""
+    output = tmp_path / "dump.json"
+    dev = Device("NAS", "10.0.0.9")
+    dev.services["smb"] = Samba(kind="smb", ip="10.0.0.9", port=445, auth_required=True)
+    net_scanner.devices["10.0.0.9"] = dev
+
+    await dump(str(output), scan_seconds=0, scanner=net_scanner)
+
+    data = json.loads(output.read_text())
+    nas = next(d for d in data["devices"] if d["hostname"] == "NAS")
+    file_shares_tab = next(t for t in nas["category_tabs"] if t["category"] == "File Shares")
+    entry = file_shares_tab["entries"][0]
+    assert entry["actions"] == []
+    assert entry["login_fields"] == ["user", "password"]
 
 
 async def test_dump_prints_to_stdout_when_no_output_is_given(net_scanner, capsys):

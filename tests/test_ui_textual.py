@@ -196,23 +196,24 @@ async def test_category_tab_shows_a_fallback_label_for_a_silent_service():
         assert "Raw Printing (JetDirect)" in rendered
 
 
-async def test_form_submission_runs_the_action_with_typed_values():
+async def test_form_submission_runs_the_action_with_typed_values(monkeypatch, popen_calls):
     """Verify that filling in and submitting a form action (ssh's sftp browse form)
     runs the action with the typed field values, by checking the resulting Popen
     command includes the typed username. The sftp resource lives under File Shares
-    now (ssh spans Terminal + File Shares - see Ssh.get_resources), not Terminal."""
+    now (ssh spans Terminal + File Shares - see Ssh.resources), not Terminal.
+    Pinned to the plain-xdg-open path (see test_actions.py for the gio-open/
+    gtk-launch branch) so this test's own assertion is only about the UI wiring."""
     from textual.widgets import Input
 
     from netlook.core import actions as actions_module
+
+    monkeypatch.setattr(actions_module, "_uses_gio_open", lambda: False)
 
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("MyNAS", "10.0.0.5")
     dev.add_service("_ssh._tcp.local.", 22, {}, None)
     scanner.devices["10.0.0.5"] = dev
     app = NetworkBrowserApp(scanner=scanner)
-
-    calls = []
-    actions_module.subprocess.Popen = lambda cmd: calls.append(cmd)
 
     async with app.run_test(size=PILOT_SIZE) as pilot:
         await pilot.pause()
@@ -233,7 +234,54 @@ async def test_form_submission_runs_the_action_with_typed_values():
         await pilot.click(browse_button)
         await pilot.pause()
 
-        assert calls == [["xdg-open", "sftp://bob@10.0.0.5"]]
+        assert popen_calls == [["xdg-open", "sftp://bob@10.0.0.5"]]
+
+
+async def test_login_form_submission_calls_request_items_with_typed_credentials():
+    """Verify that filling in and submitting the login form (smb's sign-in prompt,
+    shown once auth_required) calls scanner.request_items with the typed
+    credentials, by monkeypatching request_items to capture the call - the
+    login-prompt equivalent of test_form_submission_runs_the_action_with_typed_values
+    above (which exercises a real Action.run()); this exercises submit_login's
+    scanner.request_items hand-off instead, since a login prompt isn't an Action
+    at all. No prior coverage existed for this path - filling a real gap, not
+    updating an existing test."""
+    from textual.widgets import Input
+
+    scanner = NetworkScanner(discovery_engines=[])
+    dev = Device("MyNAS", "10.0.0.5")
+    dev.add_service("_smb._tcp.local.", 445, {}, "MyNAS")
+    dev.services["smb"].auth_required = True
+    scanner.devices["10.0.0.5"] = dev
+    app = NetworkBrowserApp(scanner=scanner)
+
+    calls = []
+
+    async def fake_request_items(service, **kwargs):
+        calls.append((service, kwargs))
+
+    scanner.request_items = fake_request_items
+
+    async with app.run_test(size=PILOT_SIZE) as pilot:
+        await pilot.pause()
+        app.view_state.expand("10.0.0.5")
+        await app.refresh_now()
+        await pilot.pause()
+
+        tabbed = app.query_one(TabbedContent)
+        tabbed.active = "tab-FILE_SHARES"
+        await pilot.pause()
+
+        user_input = next(inp for inp in app.query(Input) if inp.placeholder == "user")
+        user_input.value = "bob"
+        password_input = next(inp for inp in app.query(Input) if inp.placeholder == "password")
+        password_input.value = "secret"
+        submit_button = next(b for b in app.query(Button) if str(b.label) == "sign in")
+
+        await pilot.click(submit_button)
+        await pilot.pause()
+
+        assert calls == [(dev.services["smb"], {"user": "bob", "password": "secret"})]
 
 
 async def test_properties_tab_shows_decoded_txt_records():

@@ -37,10 +37,12 @@ from .base import (
     ActionView,
     CategoryTabView,
     DeviceRowView,
+    LoginPromptView,
     ViewModelState,
     build_device_row_view,
     properties_section_ids,
     save_devices_to_json,
+    submit_login,
 )
 
 # ----------------------------------------------------------------------------------
@@ -299,11 +301,22 @@ def _bind_unicode_font() -> None:
         return
 
 
+def _on_escape_key(sender, app_data) -> None:
+    dpg.stop_dearpygui()
+
+
 def build_ui():
     dpg.create_context()
     _bind_unicode_font()
     dpg.bind_theme(_catppuccin_mocha_theme())
-    with dpg.window(label="Network Browser", width=600, height=400):
+    with dpg.handler_registry():
+        dpg.add_key_press_handler(dpg.mvKey_Escape, callback=_on_escape_key)
+    # Primary (not just a plain window): fills the viewport as the app's own main
+    # surface instead of floating inside it as a separate, title-barred, collapsible
+    # child - there's only ever one window here, so a viewport-within-a-viewport
+    # look (drag handle, collapse arrow, its own border) is chrome with nothing to
+    # manage, not a real second surface.
+    with dpg.window(tag="main_window"):
         # header_row=False + a narrow unlabeled first column: a plain left-hand
         # gutter for the disclosure arrow, sitting right next to each device's name
         # in the wide second column.
@@ -317,6 +330,7 @@ def build_ui():
 
     dpg.create_viewport(title="Local Network Browser", width=600, height=400)
     dpg.setup_dearpygui()
+    dpg.set_primary_window("main_window", True)
     dpg.show_viewport()
 
 
@@ -445,13 +459,21 @@ def _log_if_failed(future: "asyncio.Future") -> None:
 # ----------------------------------------------------------------------------------
 
 # (ip, service kind, category) -> {field name: value}, preserved across rebuilds
-# triggered by unrelated network activity (the whole table gets wiped and rebuilt on
-# any change). Purely DPG-thread-local - forms are only ever read/written here, so
+# triggered by unrelated network activity (only the affected row gets wiped and
+# rebuilt now - see refresh_table - but a row mid-rebuild still loses its own live
+# widgets). Purely DPG-thread-local - forms are only ever read/written here, so
 # unlike expand state this never needs to cross the thread boundary.
 _view_state = ViewModelState()
 # The most recently rendered snapshot, kept so _snapshot_form_inputs (called just
-# before the *next* rebuild replaces it) knows which form tags might still exist.
+# before the *next* rebuild replaces it) knows which form tags might still exist,
+# and so refresh_table can diff against it to find which rows actually changed.
 _last_rendered_views: list[DeviceRowView] = []
+# ips rendered expanded as of _last_rendered_views - expand/collapse alone doesn't
+# always change a DeviceRowView's own fields (a device with no expandable category
+# still renders differently expanded vs. collapsed - see refresh_table), so it's
+# tracked as its own diff input rather than folded into DeviceRowView itself, which
+# has no business knowing about per-frontend UI state (see ViewModelState).
+_last_rendered_expanded: set[str] = set()
 _bridge: CoreBridge | None = None
 
 
@@ -459,18 +481,25 @@ def _field_tag(kind: str, ip: str, field_name: str, category: ResourceCategory |
     return f"{kind}_{field_name}::{ip}::{category.name if category else 'summary'}"
 
 
+def _snapshot_fields(dev_view: DeviceRowView, kind: str, category: ResourceCategory | None,
+                      fields: tuple[str, ...]) -> None:
+    """Shared by _snapshot_form_inputs for both an ActionView's fields and a
+    LoginPromptView's - same tag scheme, same cache key, just a different source
+    of field names."""
+    tags = {name: _field_tag(kind, dev_view.ip, name, category) for name in fields}
+    values = {name: dpg.get_value(tag) for name, tag in tags.items() if dpg.does_item_exist(tag)}
+    if values:
+        _view_state.form_input_cache[(dev_view.ip, kind, category)] = values
+
+
 def _snapshot_form_inputs() -> None:
     for dev_view in _last_rendered_views:
         for tab in dev_view.category_tabs:
             for entry in tab.entries:
                 for action_view in entry.actions:
-                    tags = {
-                        name: _field_tag(entry.kind, dev_view.ip, name, tab.category)
-                        for name in action_view.fields
-                    }
-                    values = {name: dpg.get_value(tag) for name, tag in tags.items() if dpg.does_item_exist(tag)}
-                    if values:
-                        _view_state.form_input_cache[(dev_view.ip, entry.kind, tab.category)] = values
+                    _snapshot_fields(dev_view, entry.kind, tab.category, action_view.fields)
+                if entry.login:
+                    _snapshot_fields(dev_view, entry.kind, tab.category, entry.login.fields)
 
 
 def _snapshot_properties_expanded() -> None:
@@ -541,10 +570,6 @@ def _add_form(ip: str, kind: str, category: ResourceCategory | None, action_view
         dpg.add_input_text(label=name, tag=tag, width=140, password=(name == "password"),
                             default_value=cached.get(name, ""), on_enter=True,
                             callback=_on_form_submit, user_data=submit_data)
-    if getattr(action_view.action, "failed", False) and "password" in tags:
-        dpg.bind_item_theme(tags["password"], _get_error_theme())
-        with dpg.tooltip(tags["password"]):
-            dpg.add_text("Sign-in failed - check username/password")
     dpg.add_button(label=action_view.label, small=True, callback=_on_form_submit, user_data=submit_data)
 
 
@@ -553,6 +578,30 @@ def _add_action(ip: str, kind: str, category: ResourceCategory | None, action_vi
         _add_form(ip, kind, category, action_view)
     else:
         dpg.add_button(label=action_view.label, small=True, callback=_on_action_click, user_data=action_view.action)
+
+
+def _on_login_submit(sender, app_data, user_data):
+    login, tags = user_data
+    kwargs = {name: dpg.get_value(tag) for name, tag in tags.items()}
+    _bridge.run_coroutine(submit_login(_bridge.scanner, login, **kwargs))
+
+
+def _add_login_form(ip: str, kind: str, category: ResourceCategory | None, login: LoginPromptView):
+    """Parallel to _add_form, for a LoginPromptView instead of a form-backed
+    ActionView - submits via submit_login (scanner.request_items) rather than
+    action.run(), since a login prompt isn't an Action at all."""
+    cached = _view_state.form_input_cache.get((ip, kind, category), {})
+    tags = {name: _field_tag(kind, ip, name, category) for name in login.fields}
+    submit_data = (login, tags)
+    for name, tag in tags.items():
+        dpg.add_input_text(label=name, tag=tag, width=140, password=(name == "password"),
+                            default_value=cached.get(name, ""), on_enter=True,
+                            callback=_on_login_submit, user_data=submit_data)
+    if login.failed and "password" in tags:
+        dpg.bind_item_theme(tags["password"], _get_error_theme())
+        with dpg.tooltip(tags["password"]):
+            dpg.add_text("Sign-in failed - check username/password")
+    dpg.add_button(label="sign in", small=True, callback=_on_login_submit, user_data=submit_data)
 
 
 def _add_overview_row(dev_view: DeviceRowView):
@@ -576,6 +625,8 @@ def _add_category_tab(dev_view: DeviceRowView, tab: CategoryTabView):
                     dpg.add_text(f"  {entry.status_text}")
                 if entry.fallback_label:
                     dpg.add_text(f"  {entry.fallback_label}")
+                if entry.login:
+                    _add_login_form(dev_view.ip, entry.kind, tab.category, entry.login)
                 for action_view in entry.actions:
                     _add_action(dev_view.ip, entry.kind, tab.category, action_view)
 
@@ -714,7 +765,11 @@ def _add_names_tab(dev_view: DeviceRowView):
                     dpg.bind_item_theme(name_item, _get_alias_theme())
 
 
-def build_device_row(dev_view: DeviceRowView, bridge: CoreBridge) -> None:
+def _row_tag(ip: str) -> str:
+    return f"device_row::{ip}"
+
+
+def build_device_row(dev_view: DeviceRowView, bridge: CoreBridge, before: int | str = 0) -> None:
     """The whole per-device row: a disclosure arrow in the table's narrow first
     column, sitting directly left of the device's name, and everything else in the
     wide second column.
@@ -732,9 +787,11 @@ def build_device_row(dev_view: DeviceRowView, bridge: CoreBridge) -> None:
     switched to manually (see _on_tab_changed); defaults to Names.
 
     Reads entirely from dev_view (ui/base.py's DeviceRowView) - never touches a live
-    Device/Service, since those live on the core thread."""
+    Device/Service, since those live on the core thread. Tagged with _row_tag(ip) and
+    placed at `before` (another row's tag, or 0 to append) so refresh_table can
+    delete and reinsert just this one row in place instead of the whole table."""
     is_open = bridge.is_expanded(dev_view.ip)
-    with dpg.table_row(parent="device_list"):
+    with dpg.table_row(parent="device_list", tag=_row_tag(dev_view.ip), before=before):
         dpg.add_button(label="▼" if is_open else "▶", small=True,
                         callback=_on_device_toggle_click, user_data=dev_view.ip)
         with dpg.group():
@@ -762,7 +819,22 @@ def build_device_row(dev_view: DeviceRowView, bridge: CoreBridge) -> None:
 
 
 def refresh_table(bridge: CoreBridge) -> None:
-    global _last_rendered_views
+    """Rebuilds only the rows whose rendered content actually changed since the last
+    publish, not the whole device_list - scanner.dirty (see scanner.py) flips on any
+    background discovery activity anywhere on the network, not just on the device a
+    user is actually looking at, so wiping and rebuilding every row on every tick used
+    to tear down and recreate whatever row was expanded or mid-login far more often
+    than its own content ever changed - losing focus, tab-hover, and other transient
+    DPG widget state each time, which read as flicker.
+
+    Devices are only ever appended to NetworkScanner.devices, never reordered or
+    removed (see scanner.py) - so an unchanged row's position never needs to move.
+    Walking `views` back-to-front and reinserting only changed/new rows `before` the
+    next row's tag works because, by induction, that next row is already at its
+    correct final position by the time it's used as an anchor: either it was never
+    touched, or - since it's processed earlier in this same backward pass - it was
+    already rebuilt there itself."""
+    global _last_rendered_views, _last_rendered_expanded
     version, views = bridge.read_snapshot()
     if version == refresh_table.last_version:
         return
@@ -770,10 +842,32 @@ def refresh_table(bridge: CoreBridge) -> None:
 
     _snapshot_form_inputs()
     _snapshot_properties_expanded()
-    dpg.delete_item("device_list", children_only=True, slot=1)  # slot=1: rows only, columns untouched
-    for dev_view in views:
-        build_device_row(dev_view, bridge)
+
+    old_by_ip = {v.ip: v for v in _last_rendered_views}
+    new_ips = {v.ip for v in views}
+    for stale_ip in old_by_ip.keys() - new_ips:
+        tag = _row_tag(stale_ip)
+        if dpg.does_item_exist(tag):
+            dpg.delete_item(tag)
+
+    expanded_now: dict[str, bool] = {}
+    for i in range(len(views) - 1, -1, -1):
+        dev_view = views[i]
+        is_open = bridge.is_expanded(dev_view.ip)
+        expanded_now[dev_view.ip] = is_open
+        # A device with no expandable category renders identically whether "open" or
+        # not, aside from the disclosure arrow, so DeviceRowView equality alone can't
+        # be trusted to catch every expand/collapse - is_open has to be compared too.
+        if dev_view == old_by_ip.get(dev_view.ip) and is_open == (dev_view.ip in _last_rendered_expanded):
+            continue
+        tag = _row_tag(dev_view.ip)
+        if dpg.does_item_exist(tag):
+            dpg.delete_item(tag)
+        before = _row_tag(views[i + 1].ip) if i + 1 < len(views) else 0
+        build_device_row(dev_view, bridge, before=before)
+
     _last_rendered_views = views
+    _last_rendered_expanded = {ip for ip, open_ in expanded_now.items() if open_}
 
 
 refresh_table.last_version = -1

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+import threading
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
@@ -258,7 +259,17 @@ class WsdDiscovery(DiscoveryEngine):
         if self._task:
             self._task.cancel()
         if self._wsd:
-            self._wsd.stop()
+            # ThreadedWSDiscovery.stop() joins its own internal networking/address-
+            # monitor threads synchronously, which - since those threads poll on a
+            # ~1s interval - makes stop() itself block for about that long. Those
+            # threads are already daemons (wsdiscovery's own _StoppableDaemonThread),
+            # so nothing leaks if the process exits before this finishes; not worth
+            # making our own shutdown (and the whole app quitting on Escape/close)
+            # wait on a foreign library's teardown pace, especially right after
+            # start() when a searchServices() call may still be mid-flight in a
+            # to_thread worker (an in-progress time.sleep() that can't be cancelled
+            # either way).
+            threading.Thread(target=self._wsd.stop, daemon=True).start()
 
     async def _poll_loop(self) -> None:
         while True:

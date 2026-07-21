@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from ..core.actions import Action, display_name
-from ..core.models import Device, GROUPED_CATEGORIES, Resource, ResourceCategory, Service
+from ..core.models import Device, Fetchable, FetchState, GROUPED_CATEGORIES, Resource, ResourceCategory, Service
 from ..core.scanner import NetworkScanner
 
 
@@ -50,14 +50,29 @@ class ServiceOverviewEntry:
 
 
 @dataclass
+class LoginPromptView:
+    """Rendered instead of a CategoryEntry's actions/status_text when its service
+    needs credentials before fetch() can proceed (see _build_entry). Submitting it
+    calls scanner.request_items(service, **kwargs) directly via submit_login below
+    - not action.run() - since this isn't a launch action, it's
+    fetch-parameterization: there's no Action/Resource behind it at all."""
+    fields: tuple[str, ...]
+    service: Service  # live reference, used only to submit - never serialized (see device_row_view_to_dict)
+    failed: bool  # from service.tried_auth - Samba-specific, not part of the Fetchable contract itself
+
+
+@dataclass
 class CategoryEntry:
     """One service's contribution to a single category tab. Self-contained: a
     renderer never needs to re-derive "show the fallback label instead" logic -
-    fallback_label is already None unless that's genuinely what should render."""
+    fallback_label is already None unless that's genuinely what should render.
+    login is mutually exclusive with actions/status_text/fallback_label - set only
+    when this service needs credentials before it can offer anything else."""
     kind: str
     actions: list[ActionView]
     status_text: str | None
     fallback_label: str | None  # display_name(kind), only set when actions and status_text are both empty
+    login: LoginPromptView | None = None
 
 
 @dataclass
@@ -141,7 +156,17 @@ def _build_entry(service: Service, category: ResourceCategory,
     silent (a permanently-informational kind like device-info, or a base-Service
     kind with no launch scheme or web admin page registered), whose properties are
     already comprehensively shown in the Properties tab. Nothing is lost, just not
-    repeated here."""
+    repeated here.
+
+    A Fetchable service currently AUTH_REQUIRED (only Samba, today) short-circuits
+    into a LoginPromptView instead of its actions/status_text - reading fetch_state
+    directly here is a read for rendering, not a decision to act (see
+    NetworkScanner.ensure_fetched for that decision, made before this is ever
+    called)."""
+    if isinstance(service, Fetchable) and service.fetch_state == FetchState.AUTH_REQUIRED:
+        login = LoginPromptView(fields=service.fetch_fields(), service=service,
+                                 failed=getattr(service, "tried_auth", False))
+        return CategoryEntry(kind=service.kind, actions=[], status_text=None, fallback_label=None, login=login)
     actions = [
         ActionView(r.action.label, r.action.fields, r.action)
         for r in resources_by_kind[service.kind]
@@ -161,7 +186,14 @@ def _build_grouped_entry(services: list[Service], category: ResourceCategory,
     picking just one, since more than one matching service could plausibly have
     something to say at once (today, only Cups ever actually does); fallback_label
     only applies if the whole group has nothing else to show, matching the
-    single-service rule in _build_entry, just aggregated across the group."""
+    single-service rule in _build_entry, just aggregated across the group.
+
+    Deliberately doesn't check for a login prompt the way _build_entry does - no
+    Fetchable service is ever a member of a grouped category today
+    (SERVICE_CATEGORIES only groups Printers, and smb is deliberately never in
+    it), so this is a real but currently unexercised assumption, not a considered
+    simplification: a future Fetchable service joining a grouped category would
+    need the same AUTH_REQUIRED handling taught here too."""
     actions = [
         ActionView(r.action.label, r.action.fields, r.action)
         for service in services
@@ -178,20 +210,22 @@ def _build_grouped_entry(services: list[Service], category: ResourceCategory,
 
 async def build_device_row_view(dev: Device, scanner: NetworkScanner, expanded: bool = False) -> DeviceRowView:
     """`expanded` gates category_tabs entirely, not just their rendering: building
-    them calls get_resources(expanded=True, ...), which is exactly what triggers a
-    not-yet-fetched service's lazy fetch (scanner.request_items(...)). Computing
-    category_tabs unconditionally for every device on every refresh - regardless of
-    whether any frontend has that row open - would silently reintroduce the eager,
-    unprompted-fetch problem lazy loading exists to prevent (e.g. anonymous SMB auth
-    attempts against every discovered device, not just ones a user actually opened).
-    overview and properties are always safe to build: overview only ever calls
-    get_resources(expanded=False, ...), which never fetches; properties only reads
-    already-discovered service.properties, never triggering anything either."""
+    them calls scanner.ensure_fetched(service) for every service on this device,
+    which is exactly what triggers a not-yet-fetched Fetchable service's lazy fetch.
+    Computing category_tabs unconditionally for every device on every refresh -
+    regardless of whether any frontend has that row open - would silently
+    reintroduce the eager, unprompted-fetch problem lazy loading exists to prevent
+    (e.g. anonymous SMB auth attempts against every discovered device, not just
+    ones a user actually opened). overview and properties are always safe to
+    build: overview only ever reads service.resources() filtered to .immediate,
+    which never triggers a fetch (resources() itself is pure - see
+    models.Service.resources); properties only reads already-discovered
+    service.properties, never triggering anything either."""
     overview: list[ServiceOverviewEntry] = []
     for service in dev.services.values():
         actions = [
             ActionView(r.action.label, r.action.fields, r.action)
-            async for r in service.get_resources(expanded=False, scanner=scanner)
+            for r in service.resources() if r.immediate
         ]
         view_category_labels = []
         if not actions and service.expandable:
@@ -210,12 +244,15 @@ async def build_device_row_view(dev: Device, scanner: NetworkScanner, expanded: 
         # Each service's resources are computed once here, not once per category it
         # spans - a multi-category service (ssh) is only asked once; grouping by
         # resource.category happens below instead of asking the service to filter
-        # itself against a category parameter repeatedly.
+        # itself against a category parameter repeatedly. ensure_fetched is called
+        # for every service unconditionally here (not just ones that turn out to
+        # match a category below) - same as the old get_resources(expanded=True,
+        # ...) call this replaces, which triggered Samba/Incus/Cups's own fetch
+        # the same way regardless of what it ended up yielding.
         resources_by_kind: dict[str, list[Resource]] = {}
         for service in dev.services.values():
-            resources_by_kind[service.kind] = [
-                r async for r in service.get_resources(expanded=True, scanner=scanner)
-            ]
+            await scanner.ensure_fetched(service)
+            resources_by_kind[service.kind] = list(service.resources())
 
         for category in ResourceCategory:
             matching = [s for s in dev.services.values() if category in s.categories]
@@ -272,12 +309,24 @@ async def build_device_row_view(dev: Device, scanner: NetworkScanner, expanded: 
     )
 
 
+async def submit_login(scanner: NetworkScanner, login: LoginPromptView, **values) -> None:
+    """Resubmits the owning service's fetch with credentials - the login-prompt
+    equivalent of an ActionView's action.run(scanner, **kwargs), but calling
+    scanner.request_items directly since a login prompt isn't an Action at all.
+    Only "user" is trimmed (matching smbclient's own tolerance for whitespace
+    around a username but not a password) - normalization lives here once,
+    instead of duplicated in both frontends' submit handlers."""
+    kwargs = {name: (value.strip() if name == "user" else value) for name, value in values.items()}
+    await scanner.request_items(login.service, **kwargs)
+
+
 def _action_to_dict(action_view: ActionView) -> dict:
-    """label/fields/uri only - never dumped via dataclasses.asdict() on the whole
-    ActionView, since some Action subclasses embed a full Service reference
-    (CredentialAction.service) whose own properties dict has bytes keys that don't
-    serialize to JSON at all. This is a deliberate, explicit allowlist of what's
-    actually worth exporting, not a blind recursive dump."""
+    """label/fields/uri only - a deliberate, explicit allowlist of what's actually
+    worth exporting, not a blind dataclasses.asdict() dump of the whole ActionView.
+    LoginPromptView (below) needs the same care for the same reason - it carries a
+    live Service reference whose properties dict has bytes keys that don't
+    serialize to JSON at all - which is exactly why its own dict shape only ever
+    exports `fields`, never the service itself."""
     return {"label": action_view.label, "fields": list(action_view.fields),
             "uri": getattr(action_view.action, "uri", None)}
 
@@ -312,6 +361,13 @@ def device_row_view_to_dict(view: DeviceRowView) -> dict:
                         "actions": [_action_to_dict(a) for a in entry.actions],
                         "status_text": entry.status_text,
                         "fallback_label": entry.fallback_label,
+                        # Present (nullable) for every entry, matching status_text/
+                        # fallback_label's convention - only set when this service
+                        # needs credentials before it can offer anything else. Just
+                        # the field names: `failed` and the live service reference
+                        # aren't serializable data, they're transient sign-in UI
+                        # state and a live object respectively (see _action_to_dict).
+                        "login_fields": list(entry.login.fields) if entry.login else None,
                     }
                     for entry in tab.entries
                 ],

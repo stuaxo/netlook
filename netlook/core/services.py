@@ -9,30 +9,39 @@ import logging
 import os
 import re
 import shutil
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from typing import ClassVar
+from urllib.parse import quote
 
 import httpx
 
-from .actions import (
-    CredentialAction,
-    IncusConsoleAction,
-    RemoteSessionAction,
-    ShareAction,
-    SftpBrowseAction,
-    SmbPrinterAction,
-    WebAdminAction,
+from .actions import LaunchAction, SftpBrowseAction
+from .models import (
+    Device,
+    Fetchable,
+    FetchState,
+    Resource,
+    ResourceCategory,
+    Service,
+    register,
+    remote_session_action,
+    web_admin_action,
 )
-from .models import Device, Resource, ResourceCategory, Service, register
 from .scanner import incus_get
-
-if TYPE_CHECKING:
-    from .scanner import NetworkScanner
 
 logger = logging.getLogger(__name__)
 
 HAS_SMBCLIENT = shutil.which("smbclient") is not None
+
+
+class SmbClientMissing(RuntimeError):
+    """Raised by list_smb_shares when the smbclient binary itself isn't installed -
+    deliberately distinct from both a genuinely empty listing ([], []) and an auth
+    failure (None), neither of which this is: we never even got to ask the server.
+    Conflating this with an empty listing used to make Samba.fetch report "no
+    shares found" for every device, forever, on a machine missing the package -
+    indistinguishable from a device that really has none."""
 
 
 @dataclass
@@ -44,10 +53,11 @@ class SmbShare:
 async def list_smb_shares(ip: str, username: str | None = None,
                            password: str | None = None) -> tuple[list[SmbShare], list[SmbShare]] | None:
     """Returns (disk_shares, printer_shares) - either may genuinely be empty - or
-    None if auth is required/failed."""
+    None if auth is required/failed. Raises SmbClientMissing if the smbclient
+    binary itself isn't installed."""
     if not HAS_SMBCLIENT:
         logger.warning("smbclient not found; can't list shares")
-        return [], []
+        raise SmbClientMissing
 
     cmd = ["smbclient", "-L", f"//{ip}", "-g"]
     env = None
@@ -84,14 +94,36 @@ async def list_smb_shares(ip: str, username: str | None = None,
     return None  # nonzero exit with nothing listed: treat as an auth failure
 
 
+def _smb_authority(ip: str, username: str | None) -> str:
+    """`user@host`, or just `host` if this fetch was anonymous. Only the username is
+    embedded - never the password: it would otherwise sit in plain sight in argv
+    (visible to any local user via `ps`) for the lifetime of the xdg-open process.
+    Carrying the username at least means the file manager's own auth prompt only
+    needs a password, not both, and most (GVfs-based) prompts offer to remember it
+    via the keyring after that."""
+    auth = f"{quote(username)}@" if username else ""
+    return f"{auth}{ip}"
+
+
 @register("smb")
 @dataclass
-class Samba(Service):
+class Samba(Service, Fetchable):
     expandable: ClassVar[bool] = True
     shares: list[SmbShare | str] | None = None
     printers: list[SmbShare | str] | None = None
     auth_required: bool = False
     tried_auth: bool = False  # True once a *credentialed* attempt has failed
+    smbclient_missing: bool = False  # True once fetch() has found no smbclient binary
+    # The username behind the current shares/printers listing, so links built from
+    # it (see resources()) can carry it too - None for an anonymous listing.
+    username: str | None = None
+    # Set once by enrich_device, so _share_action/_printer_action can build their
+    # smb:// uri from Device.smb_host() (a wsdd/mDNS name, preferred over a bare ip
+    # - see that method) instead of always using self.ip. compare=False/repr=False:
+    # this is a live back-reference, not this service's own data - comparing it
+    # would recurse right back into this very Samba instance via Device.services,
+    # and dataclass __eq__/__repr__ have no cycle protection.
+    _device: "Device | None" = field(default=None, compare=False, repr=False)
 
     def __setattr__(self, name: str, value) -> None:
         # Lets `shares`/`printers` be assigned as bare share names (a plain string
@@ -106,35 +138,83 @@ class Samba(Service):
     def status_text(self) -> str | None:
         if self.loading:
             return "loading..."
+        if self.smbclient_missing:
+            return "smbclient not installed"
         if self.shares is not None and not self.shares and not self.printers and not self.auth_required:
             return "no shares found"
         return None
 
+    @property
+    def fetch_state(self) -> FetchState:
+        # auth_required must be checked before "shares is not None": a failed
+        # fetch also leaves shares as None, so checking "not fetched yet" first
+        # would misreport an auth failure as never having been attempted at all.
+        if self.loading:
+            return FetchState.LOADING
+        if self.auth_required:
+            return FetchState.AUTH_REQUIRED
+        if self.shares is not None:
+            return FetchState.LOADED
+        return FetchState.NOT_FETCHED
+
+    def fetch_fields(self) -> tuple[str, ...]:
+        return ("user", "password") if self.fetch_state == FetchState.AUTH_REQUIRED else ()
+
     async def fetch(self, user: str = "", password: str = "") -> None:
-        result = await list_smb_shares(self.ip, user or None, password)
         self.loading = False
+        try:
+            result = await list_smb_shares(self.ip, user or None, password)
+        except SmbClientMissing:
+            self.smbclient_missing = True
+            self.auth_required = False
+            self.tried_auth = False
+            self.shares, self.printers = [], []
+            self.username = None
+            return
         self.auth_required = result is None
         self.tried_auth = bool(user) and result is None
         self.shares, self.printers = result if result is not None else (None, None)
+        self.username = user or None if result is not None else None
 
-    async def get_resources(self, expanded: bool, scanner: "NetworkScanner") -> AsyncIterator[Resource]:
-        if not expanded or self.loading:
-            return
-        # auth_required must be checked before "shares is None": a failed fetch also
-        # leaves shares as None, and re-triggering an anonymous fetch would loop
-        # forever.
-        if self.auth_required:
-            yield Resource(ResourceCategory.FILE_SHARES, CredentialAction.from_service(self, failed=self.tried_auth))
-            return
+    def enrich_device(self, device: "Device") -> None:
+        super().enrich_device(device)
+        self._device = device
+
+    def _host(self) -> str:
+        """Device.smb_host()'s wsdd/mDNS-preferred name, when this service has
+        actually been attached to a device (see enrich_device) - a Samba built
+        directly, without going through Device.add_service (only ever done in
+        tests), falls back to its own bare ip instead."""
+        return self._device.smb_host() if self._device else self.ip
+
+    def _share_action(self, share: SmbShare) -> LaunchAction:
+        return LaunchAction(label=share.name, uri=f"smb://{_smb_authority(self._host(), self.username)}/{share.name}")
+
+    def _printer_action(self, printer: SmbShare) -> LaunchAction:
+        """A basic placeholder for an SMB-shared printer resource. Unlike a file
+        share, there's no single standard "open" action for a network printer -
+        most desktops resolve one through their own Add Printer/CUPS dialog, not a
+        uri a browser or file manager can act on directly. This reuses the same
+        smb:// address a file share would use, since some file managers can still
+        browse/resolve it; treat it as a starting point to build on, not a
+        finished "connect me" flow."""
+        return LaunchAction(label=printer.name,
+                             uri=f"smb://{_smb_authority(self._host(), self.username)}/{printer.name}")
+
+    def resources(self) -> Iterator[Resource]:
+        # Nothing to yield until a fetch has actually landed - covers NOT_FETCHED,
+        # LOADING, and AUTH_REQUIRED alike (all leave shares as None); triggering
+        # that fetch, and surfacing a login prompt for AUTH_REQUIRED, are both the
+        # caller's job now (see NetworkScanner.ensure_fetched and ui/base.py's
+        # LoginPromptView), not this method's.
         if self.shares is None:
-            await scanner.request_items(self)
             return
         # Both share types come from the same fetch and render together - see
         # SERVICE_CATEGORIES's comment on why smb doesn't get its own Printers tab.
         for share in self.shares:
-            yield Resource(ResourceCategory.FILE_SHARES, ShareAction.from_resource(self, share))
+            yield Resource(ResourceCategory.FILE_SHARES, self._share_action(share), immediate=False)
         for printer in self.printers or []:
-            yield Resource(ResourceCategory.FILE_SHARES, SmbPrinterAction.from_resource(self, printer))
+            yield Resource(ResourceCategory.FILE_SHARES, self._printer_action(printer), immediate=False)
 
 
 @dataclass
@@ -145,7 +225,7 @@ class IncusInstance:
 
 @register("incus")
 @dataclass
-class Incus(Service):
+class Incus(Service, Fetchable):
     expandable: ClassVar[bool] = True
     instances: list[IncusInstance] | None = None
     accessible: bool = True  # False: fetched, but the server didn't trust our client
@@ -167,6 +247,18 @@ class Incus(Service):
                 return "no instances found"
         return None
 
+    @property
+    def fetch_state(self) -> FetchState:
+        # "not accessible" (accessible=False) is still a completed fetch, not an
+        # auth prompt - unlike Samba, Incus has no interactive retry-with-
+        # credentials flow, so an inaccessible server just shows as LOADED with an
+        # empty instance list and an explanatory error (see extra_properties).
+        if self.loading:
+            return FetchState.LOADING
+        if self.instances is not None:
+            return FetchState.LOADED
+        return FetchState.NOT_FETCHED
+
     def extra_properties(self) -> list[tuple[str, str]]:
         return [("error", self.error)] if self.error else []
 
@@ -185,51 +277,70 @@ class Incus(Service):
         self.error = None
         self.instances = [IncusInstance(i.get("name", "?"), i.get("status", "?")) for i in payload["metadata"]]
 
-    async def get_resources(self, expanded: bool, scanner: "NetworkScanner") -> AsyncIterator[Resource]:
-        # The general web-admin link is yielded regardless of expanded, not just
-        # collapsed: without it, a device with zero instances (or not yet fetched,
-        # or inaccessible) would leave the Virtual Machines tab with a status_text
-        # but nothing clickable at all - a dead end for a service that plainly has
-        # a working link available, same principle as the base Service class and
-        # ipp (see their get_resources). Per-instance console links, once fetched,
+    def _console_action(self, instance: IncusInstance) -> LaunchAction:
+        # incus's web UI has no stable per-instance deep link across versions, so
+        # this just opens the UI root - the label at least tells you what to look
+        # for.
+        return LaunchAction(label=f"{instance.name} ({instance.status})", uri=f"https://{self.ip}:{self.port}/ui/")
+
+    def resources(self) -> Iterator[Resource]:
+        # The general web-admin link is always yielded, not just once fetched:
+        # without it, a device with zero instances (or not yet fetched, or
+        # inaccessible) would leave the Virtual Machines tab with a status_text but
+        # nothing clickable at all - a dead end for a service that plainly has a
+        # working link available, same principle as the base Service class and ipp
+        # (see their resources()). Per-instance console links, once fetched,
         # supplement this rather than replacing it.
-        yield Resource(ResourceCategory.VIRTUAL_MACHINES,
-                        WebAdminAction.from_service(self, path="/ui/", scheme="https"))
-        if not expanded or self.loading:
-            return
+        yield Resource(ResourceCategory.VIRTUAL_MACHINES, web_admin_action(self, path="/ui/", scheme="https"))
         if self.instances is None:
-            await scanner.request_items(self)
             return
         for inst in self.instances:
-            yield Resource(ResourceCategory.VIRTUAL_MACHINES, IncusConsoleAction.from_resource(self, inst))
+            yield Resource(ResourceCategory.VIRTUAL_MACHINES, self._console_action(inst), immediate=False)
 
 
 @register("ssh")
 @dataclass
 class Ssh(Service):
     """ssh itself needs no fetch - the terminal launch is always available; expanding
-    reveals an sftp path/user form for jumping into a file manager instead. Spans two
-    categories, same idea as Samba spanning FILE_SHARES + PRINTERS: one ssh service
-    (and the credentials it holds) backs two distinct resources - a terminal launch
-    (TERMINAL) and an sftp file browser (FILE_SHARES) - each belonging in its own
-    tab, not both crammed under "Terminal" just because one service produces them."""
+    the row reveals an sftp path/user form for jumping into a file manager instead
+    (immediate=False, below - not gated on any fetch, just not worth cluttering the
+    collapsed row with). Spans two categories, same idea as Samba spanning
+    FILE_SHARES + PRINTERS: one ssh service (and the credentials it holds) backs
+    two distinct resources - a terminal launch (TERMINAL) and an sftp file browser
+    (FILE_SHARES) - each belonging in its own tab, not both crammed under
+    "Terminal" just because one service produces them."""
     expandable: ClassVar[bool] = True
+    # Set once by enrich_device, so _host can build the sftp:// browse link from
+    # Device.ssh_host() (a known_hosts/etc-hosts/mDNS name, preferred over a bare
+    # ip - see that method) instead of always using self.ip. compare=False/
+    # repr=False for the same reason as Samba._device (see there): a live
+    # back-reference, not this service's own data, whose equality would otherwise
+    # recurse right back into this very Ssh instance via Device.services.
+    _device: "Device | None" = field(default=None, compare=False, repr=False)
 
-    async def get_resources(self, expanded: bool, scanner: "NetworkScanner") -> AsyncIterator[Resource]:
-        if not expanded:
-            yield Resource(ResourceCategory.TERMINAL, RemoteSessionAction.from_service(self))
-            return
-        yield Resource(ResourceCategory.TERMINAL, RemoteSessionAction.from_service(self))
-        yield Resource(ResourceCategory.FILE_SHARES, SftpBrowseAction.from_service(self))
+    def enrich_device(self, device: "Device") -> None:
+        super().enrich_device(device)
+        self._device = device
+
+    def _host(self) -> str:
+        """Device.ssh_host() when this service has actually been attached to a
+        device (see enrich_device) - an Ssh built directly, without going through
+        Device.add_service (only ever done in tests), falls back to its own bare ip
+        instead."""
+        return self._device.ssh_host() if self._device else self.ip
+
+    def resources(self) -> Iterator[Resource]:
+        yield Resource(ResourceCategory.TERMINAL, remote_session_action(self))
+        sftp = SftpBrowseAction(ip=self._host(), port=self.port)
+        yield Resource(ResourceCategory.FILE_SHARES, sftp, immediate=False)
 
 
 class SilentService(Service):
     """A machine-to-machine protocol with no user-facing action - nothing here is
-    ever clickable, so get_resources() always yields nothing."""
+    ever clickable, so resources() always yields nothing."""
 
-    async def get_resources(self, expanded: bool, scanner: "NetworkScanner") -> AsyncIterator[Resource]:
-        for _ in ():
-            yield
+    def resources(self) -> Iterator[Resource]:
+        yield from ()
 
 
 @register("pdl-datastream")
@@ -253,15 +364,16 @@ class Ipp(Service):
     that when it's there, since it's more reliable than guessing a port; port 80 is
     the fallback, since that's where most printers' embedded web servers live."""
 
-    async def get_resources(self, expanded: bool, scanner: "NetworkScanner") -> AsyncIterator[Resource]:
-        # Ignores `expanded`: ipp has exactly one resource and no deeper structure
-        # (unlike smb/incus/cups), so its Printers tab shows the same admin link
-        # Overview does, rather than a dead, unclickable fallback label.
+    def resources(self) -> Iterator[Resource]:
+        # ipp has exactly one resource and no deeper structure (unlike
+        # smb/incus/cups), so its Printers tab shows the same admin link Overview
+        # does (immediate, the default), rather than a dead, unclickable fallback
+        # label.
         admin_url = self.txt("adminurl")
         if admin_url:
-            action = WebAdminAction(label="Printer admin", uri=admin_url)
+            action = LaunchAction(label="Printer admin", uri=admin_url)
         else:
-            action = WebAdminAction.from_service(self, path="/", scheme="http", port=80, label="Printer admin")
+            action = web_admin_action(self, path="/", scheme="http", port=80, label="Printer admin")
         yield Resource(ResourceCategory.PRINTERS, action)
 
     def enrich_device(self, device: "Device") -> None:
@@ -282,7 +394,7 @@ _CUPS_QUEUE_RE = re.compile(rb'href="/printers/([^"/]+)"', re.IGNORECASE)
 
 @register("cups")
 @dataclass
-class Cups(Service):
+class Cups(Service, Fetchable):
     """A CUPS server can host several physical printer queues; each queue is a
     resource, listed lazily (mirrors how Incus lists instances). CUPS has no clean
     machine-readable "list queues" endpoint short of the binary IPP protocol, so this
@@ -301,6 +413,14 @@ class Cups(Service):
             return "no queues found"
         return None
 
+    @property
+    def fetch_state(self) -> FetchState:
+        if self.loading:
+            return FetchState.LOADING
+        if self.queues is not None:
+            return FetchState.LOADED
+        return FetchState.NOT_FETCHED
+
     async def fetch(self) -> None:
         try:
             async with httpx.AsyncClient(timeout=2) as client:
@@ -312,22 +432,19 @@ class Cups(Service):
         self.loading = False
         self.queues = sorted({m.decode(errors="replace") for m in _CUPS_QUEUE_RE.findall(body)})
 
-    async def get_resources(self, expanded: bool, scanner: "NetworkScanner") -> AsyncIterator[Resource]:
-        # The general web-admin link is yielded regardless of expanded, not just
-        # collapsed - see Incus.get_resources for why: without it, a server with
-        # zero queues (or not yet fetched) leaves the Printers tab with a
-        # status_text but nothing clickable at all. Per-queue links, once fetched,
-        # supplement this rather than replacing it.
-        action = WebAdminAction.from_service(self, path="/", scheme="http", label="Printer admin")
+    def resources(self) -> Iterator[Resource]:
+        # The general web-admin link is always yielded, not just once fetched -
+        # see Incus.resources() for why: without it, a server with zero queues (or
+        # not yet fetched) leaves the Printers tab with a status_text but nothing
+        # clickable at all. Per-queue links, once fetched, supplement this rather
+        # than replacing it.
+        action = web_admin_action(self, path="/", scheme="http", label="Printer admin")
         yield Resource(ResourceCategory.PRINTERS, action)
-        if not expanded or self.loading:
-            return
         if self.queues is None:
-            await scanner.request_items(self)
             return
         for queue in self.queues:
-            action = WebAdminAction(label=queue, uri=f"http://{self.ip}:{self.port}/printers/{queue}")
-            yield Resource(ResourceCategory.PRINTERS, action)
+            action = LaunchAction(label=queue, uri=f"http://{self.ip}:{self.port}/printers/{queue}")
+            yield Resource(ResourceCategory.PRINTERS, action, immediate=False)
 
 
 @register("device-info")

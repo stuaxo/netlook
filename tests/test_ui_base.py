@@ -6,6 +6,7 @@ from netlook.core.services import Cups, Incus, Ipp, LpdPrinterService, PdlStream
 from netlook.ui.base import (
     NAMES_TAB_ID,
     PROPERTIES_TAB_ID,
+    LoginPromptView,
     PropertiesTabView,
     PropertyEntry,
     ViewModelState,
@@ -13,6 +14,7 @@ from netlook.ui.base import (
     device_row_view_to_dict,
     properties_section_ids,
     save_devices_to_json,
+    submit_login,
 )
 
 from doubles import FakeScanner
@@ -74,9 +76,9 @@ async def test_overview_gives_a_view_category_button_per_category_for_an_expanda
 async def test_category_tabs_are_empty_when_not_expanded():
     """Verify that build_device_row_view builds no category_tabs at all when
     expanded=False (the default) - not just that they'd render nothing - since
-    building them is exactly what would call get_resources(expanded=True, ...) and
-    trigger a not-yet-fetched service's lazy load. scanner=None proves this: a
-    device with an unfetched smb service builds cleanly with no scanner at all."""
+    building them is exactly what would call scanner.ensure_fetched and trigger a
+    not-yet-fetched service's lazy load. scanner=None proves this: a device with
+    an unfetched smb service builds cleanly with no scanner at all."""
     device = DeviceFactory()
     device.services["smb"] = Samba(kind="smb", ip=device.ip, port=445)
 
@@ -93,7 +95,7 @@ async def test_category_tabs_only_include_categories_with_a_matching_service():
     device = DeviceFactory()
     device.services["incus"] = Incus(kind="incus", ip=device.ip, port=8443, instances=[])
 
-    view = await build_device_row_view(device, scanner=None, expanded=True)
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
 
     assert [tab.category for tab in view.category_tabs] == [ResourceCategory.VIRTUAL_MACHINES]
 
@@ -105,7 +107,7 @@ async def test_category_tabs_include_both_categories_for_a_multi_category_servic
     device = DeviceFactory()
     device.services["ssh"] = Ssh(kind="ssh", ip=device.ip, port=22)
 
-    view = await build_device_row_view(device, scanner=None, expanded=True)
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
 
     assert {tab.category for tab in view.category_tabs} == {
         ResourceCategory.TERMINAL, ResourceCategory.FILE_SHARES,
@@ -123,7 +125,7 @@ async def test_category_tab_entry_shows_a_fallback_label_for_a_silent_service():
     device = DeviceFactory()
     device.services["pdl-datastream"] = PdlStreamService(kind="pdl-datastream", ip=device.ip, port=9100)
 
-    view = await build_device_row_view(device, scanner=None, expanded=True)
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
 
     printers_tab = next(tab for tab in view.category_tabs if tab.category == ResourceCategory.PRINTERS)
     assert len(printers_tab.entries) == 1
@@ -147,7 +149,7 @@ async def test_printers_tab_combines_multiple_services_into_one_grouped_entry():
     device.services["cups"] = Cups(kind="cups", ip=device.ip, port=631, queues=["Laser1"])
     device.services["pdl-datastream"] = PdlStreamService(kind="pdl-datastream", ip=device.ip, port=9100)
 
-    view = await build_device_row_view(device, scanner=None, expanded=True)
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
 
     printers_tab = next(tab for tab in view.category_tabs if tab.category == ResourceCategory.PRINTERS)
     assert len(printers_tab.entries) == 1
@@ -167,7 +169,7 @@ async def test_printers_tab_grouped_fallback_combines_every_silent_services_labe
     device.services["pdl-datastream"] = PdlStreamService(kind="pdl-datastream", ip=device.ip, port=9100)
     device.services["printer"] = LpdPrinterService(kind="printer", ip=device.ip, port=515)
 
-    view = await build_device_row_view(device, scanner=None, expanded=True)
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
 
     printers_tab = next(tab for tab in view.category_tabs if tab.category == ResourceCategory.PRINTERS)
     assert len(printers_tab.entries) == 1
@@ -187,7 +189,7 @@ async def test_non_grouped_categories_keep_one_entry_per_service():
     device.services["rdp"] = make_service("rdp", device.ip, 3389)
     device.services["vnc"] = make_service("vnc", device.ip, 5900)
 
-    view = await build_device_row_view(device, scanner=None, expanded=True)
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
 
     screen_share_tab = next(tab for tab in view.category_tabs if tab.category == ResourceCategory.SCREEN_SHARE)
     assert {entry.kind for entry in screen_share_tab.entries} == {"rdp", "vnc"}
@@ -203,7 +205,7 @@ async def test_purely_informational_service_gets_no_category_tab_entry():
     device = DeviceFactory()
     device.services["device-info"] = make_service("device-info", device.ip, 0)
 
-    view = await build_device_row_view(device, scanner=None, expanded=True)
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
 
     assert view.category_tabs == []
 
@@ -217,7 +219,7 @@ async def test_category_tab_omits_a_purely_informational_entry_but_keeps_the_res
     device.services["device-info"] = make_service("device-info", device.ip, 0)
     device.services["home-assistant"] = make_service("home-assistant", device.ip, 8123)
 
-    view = await build_device_row_view(device, scanner=None, expanded=True)
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
 
     system_tab = next(tab for tab in view.category_tabs if tab.category == ResourceCategory.SYSTEM)
     assert {entry.kind for entry in system_tab.entries} == {"home-assistant"}
@@ -236,6 +238,72 @@ async def test_category_tab_triggers_a_fetch_via_scanner_when_data_not_yet_loade
 
     assert len(scanner.requested) >= 1
     assert scanner.requested[0][0] is device.services["smb"]
+
+
+async def test_category_tab_triggers_a_fetch_via_scanner_when_incus_instances_not_yet_loaded():
+    """Verify that building the view for a category tab whose Incus service hasn't
+    fetched yet (instances=None) requests items via the scanner too - the Incus
+    analog of the smb test above, confirming ensure_fetched's gating isn't
+    Samba-specific."""
+    device = DeviceFactory()
+    device.services["incus"] = Incus(kind="incus", ip=device.ip, port=8443)
+    scanner = FakeScanner()
+
+    await build_device_row_view(device, scanner=scanner, expanded=True)
+
+    assert len(scanner.requested) >= 1
+    assert scanner.requested[0][0] is device.services["incus"]
+
+
+async def test_category_tab_does_not_re_trigger_a_fetch_when_auth_required():
+    """Verify that build_device_row_view does NOT call scanner.request_items for a
+    Samba service that's already AUTH_REQUIRED - regression guard for the same bug
+    a prior version of Samba.get_resources had to check auth_required before
+    "shares is None" to avoid: ensure_fetched only acts on NOT_FETCHED, so an
+    auth-required service correctly gets a login prompt instead of looping another
+    anonymous fetch."""
+    device = DeviceFactory()
+    device.services["smb"] = Samba(kind="smb", ip=device.ip, port=445, auth_required=True)
+    scanner = FakeScanner()
+
+    await build_device_row_view(device, scanner=scanner, expanded=True)
+
+    assert scanner.requested == []
+
+
+async def test_build_entry_surfaces_a_login_prompt_for_an_auth_required_service():
+    """Verify that an AUTH_REQUIRED service's category tab entry carries a
+    LoginPromptView (fields from fetch_fields, failed from tried_auth, and the
+    live service reference) instead of actions/status_text/fallback_label."""
+    device = DeviceFactory()
+    smb = Samba(kind="smb", ip=device.ip, port=445, auth_required=True, tried_auth=True)
+    device.services["smb"] = smb
+
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
+
+    file_shares_tab = next(t for t in view.category_tabs if t.category == ResourceCategory.FILE_SHARES)
+    entry = file_shares_tab.entries[0]
+    assert entry.actions == []
+    assert entry.status_text is None
+    assert entry.fallback_label is None
+    assert entry.login.fields == ("user", "password")
+    assert entry.login.failed is True
+    assert entry.login.service is smb
+
+
+async def test_submit_login_re_queries_the_owning_service_via_scanner():
+    """Verify that submit_login calls scanner.request_items with the trimmed
+    username and the login prompt's owning service, by capturing the call on a
+    fake scanner - the login-prompt equivalent of what CredentialAction.run used
+    to do, now that a login prompt isn't an Action at all."""
+    device = DeviceFactory()
+    smb = Samba(kind="smb", ip=device.ip, port=445, auth_required=True)
+    login = LoginPromptView(fields=("user", "password"), service=smb, failed=False)
+    scanner = FakeScanner()
+
+    await submit_login(scanner, login, user="  bob  ", password="secret")
+
+    assert scanner.requested == [(smb, {"user": "bob", "password": "secret"})]
 
 
 async def test_properties_decodes_raw_txt_records_and_sorts_by_kind():
@@ -370,22 +438,50 @@ async def test_device_row_view_to_dict_includes_names_and_properties():
 
 async def test_device_row_view_to_dict_extracts_only_label_fields_uri_from_actions():
     """Verify that an action serializes to just {label, fields, uri} - not a blind
-    dump of the underlying Action object - by checking a CredentialAction (which
-    embeds a full Service reference in its `service` field) doesn't leak that
-    reference or anything else into the output. This is the regression this
-    allowlist exists to prevent: Service.properties has bytes keys, which
-    dataclasses.asdict() + json.dumps would choke on entirely."""
+    dump of the underlying Action object - by checking Ssh's form-backed sftp
+    browse action (which genuinely has fields)."""
     device = DeviceFactory()
-    smb = Samba(kind="smb", ip=device.ip, port=445, auth_required=True)
-    device.services["smb"] = smb
+    device.services["ssh"] = Ssh(kind="ssh", ip=device.ip, port=22)
 
-    view = await build_device_row_view(device, scanner=None, expanded=True)
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
     result = device_row_view_to_dict(view)
 
     file_shares_tab = next(t for t in result["category_tabs"] if t["category"] == "File Shares")
     action = file_shares_tab["entries"][0]["actions"][0]
     assert set(action.keys()) == {"label", "fields", "uri"}
-    assert action["fields"] == ["user", "password"]
+    assert action["fields"] == ["user", "path"]
+
+
+async def test_device_row_view_to_dict_carries_login_fields_when_auth_required():
+    """Verify that an AUTH_REQUIRED service's category-tab entry serializes its
+    login_fields rather than a fake action - the regression this dump shape
+    exists to represent correctly, since a login prompt isn't an Action at all
+    and its live service reference (LoginPromptView.service) must never leak into
+    the JSON output the way CredentialAction.service risked doing before it."""
+    device = DeviceFactory()
+    device.services["smb"] = Samba(kind="smb", ip=device.ip, port=445, auth_required=True)
+
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
+    result = device_row_view_to_dict(view)
+
+    file_shares_tab = next(t for t in result["category_tabs"] if t["category"] == "File Shares")
+    entry = file_shares_tab["entries"][0]
+    assert entry["actions"] == []
+    assert entry["login_fields"] == ["user", "password"]
+
+
+async def test_device_row_view_to_dict_login_fields_is_null_when_not_auth_required():
+    """Verify that login_fields is present but null for a normal (non-auth-gated)
+    category-tab entry, matching status_text/fallback_label's own nullable
+    convention."""
+    device = DeviceFactory()
+    device.services["ssh"] = Ssh(kind="ssh", ip=device.ip, port=22)
+
+    view = await build_device_row_view(device, scanner=FakeScanner(), expanded=True)
+    result = device_row_view_to_dict(view)
+
+    terminal_tab = next(t for t in result["category_tabs"] if t["category"] == "Terminal")
+    assert terminal_tab["entries"][0]["login_fields"] is None
 
 
 async def test_save_devices_to_json_writes_saved_at_and_one_entry_per_view(tmp_path):

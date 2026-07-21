@@ -4,9 +4,10 @@ import json
 import pytest
 
 from netlook.core import scanner
+from netlook.core.models import FetchState
 from netlook.core.scanner import _parse_ports, _split_addresses
 
-from doubles import FetchRecordingService
+from doubles import FakeFetchable, FetchRecordingService
 
 
 @pytest.mark.parametrize("spec, expected_ports", [
@@ -283,6 +284,44 @@ async def test_request_items_sets_loading_before_the_fetch_actually_runs(net_sca
     await net_scanner.wait_idle()
 
     assert service.loading_during_fetch == [True]
+
+
+async def test_ensure_fetched_triggers_a_fetch_for_a_not_yet_fetched_service(net_scanner):
+    """Verify that ensure_fetched triggers a real fetch (via request_items) for a
+    Fetchable service whose fetch_state is NOT_FETCHED."""
+    service = FakeFetchable(fetch_state=FetchState.NOT_FETCHED)
+
+    await net_scanner.ensure_fetched(service)
+    await net_scanner.wait_idle()
+
+    assert service.fetch_calls == [{}]
+
+
+@pytest.mark.parametrize("fetch_state", [FetchState.LOADING, FetchState.LOADED, FetchState.AUTH_REQUIRED])
+async def test_ensure_fetched_is_a_noop_once_a_fetch_has_already_been_attempted(net_scanner, fetch_state):
+    """Verify that ensure_fetched does nothing for any fetch_state other than
+    NOT_FETCHED, by checking no fetch is triggered across every other state -
+    including AUTH_REQUIRED, which needs an explicit credentialed retry via
+    request_items instead (see submit_login in ui/base.py), not another automatic
+    anonymous attempt."""
+    service = FakeFetchable(fetch_state=fetch_state)
+
+    await net_scanner.ensure_fetched(service)
+    await net_scanner.wait_idle()
+
+    assert service.fetch_calls == []
+
+
+async def test_ensure_fetched_is_a_noop_for_a_service_that_isnt_fetchable(net_scanner):
+    """Verify that ensure_fetched does nothing for a service that doesn't implement
+    Fetchable at all (e.g. Ssh, Ipp - services with no fetch() of their own), by
+    checking a plain FetchRecordingService is left untouched rather than raising
+    on a missing fetch_state."""
+    service = FetchRecordingService()
+
+    await net_scanner.ensure_fetched(service)
+
+    assert service.fetch_calls == []
 
 
 @pytest.mark.parametrize("banner, expected", [

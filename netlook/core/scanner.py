@@ -27,7 +27,7 @@ import httpx
 import psutil
 
 from .discovery import DiscoveryEngine, EtcHostsDiscovery, MdnsDiscovery, SshKnownHostsDiscovery, WsdDiscovery
-from .models import Device, Service, kind_from_type
+from .models import Device, Fetchable, FetchState, Service, kind_from_type
 
 
 def _detect_local_network() -> tuple[set[str], str]:
@@ -300,13 +300,27 @@ class NetworkScanner:
         return task
 
     async def request_items(self, service: Service, **kwargs) -> None:
-        """Kick off whatever async fetch a service's get_resources() needs before it can
-        yield its real actions (a share list, an instance list, ...)."""
+        """Kick off whatever async fetch a service's resources() needs before it can
+        yield its real actions (a share list, an instance list, ...). Unconditional -
+        goes ahead with exactly these kwargs regardless of fetch_state, since a
+        caller reaching for this (rather than ensure_fetched below) already knows it
+        wants a specific fetch to happen now, e.g. a credentialed retry after
+        AUTH_REQUIRED."""
         if service.loading:
             return
         service.loading = True
         self.dirty = True  # show "loading" immediately
         self._track(self._fetch_items(service, kwargs))
+
+    async def ensure_fetched(self, service: Service) -> None:
+        """Lazily triggers service.fetch() the first time something expresses
+        interest in it (e.g. a device row is expanded) - a no-op if that's already
+        been attempted. The caller only ever needs to say "I want this now";
+        whether that becomes a real fetch is entirely this scanner's own call,
+        based on the service's own fetch_state - keeps the network tree
+        self-sufficient rather than depending on a view layer to interpret it."""
+        if isinstance(service, Fetchable) and service.fetch_state == FetchState.NOT_FETCHED:
+            await self.request_items(service)
 
     async def _fetch_items(self, service: Service, kwargs: dict) -> None:
         await service.fetch(**kwargs)
