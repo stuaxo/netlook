@@ -95,3 +95,6 @@ $ uv run netlooktui
 
 ![Screenshot of Netlook TUI](screenshots/netlook-tui.png)
 
+
+
+[What did I learn from this project?](LEARN.md)
