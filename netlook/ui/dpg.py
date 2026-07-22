@@ -1,21 +1,22 @@
-"""DearPyGui presentation layer. This is the only module in the package allowed to
-import dearpygui - everything in core/ and ui/base.py is toolkit-agnostic so a
-different frontend (ui/textual.py, a web UI, ...) could sit alongside it without
-touching either.
+"""DearPyGui presentation layer. The only module in the package allowed to
+import dearpygui - everything in core/ and ui/base.py is toolkit-agnostic,
+so a different frontend (ui/textual.py, a web UI, ...) could sit alongside
+it without touching either.
 
-DPG is strictly synchronous and must run on the main thread, but the core (scanner.py)
-is asyncio-only - so CoreBridge runs it on its own background thread with its own
-event loop. UI-triggered work (button clicks, form submits) crosses into that loop via
-asyncio.run_coroutine_threadsafe. State flows the other way through a small thread-
-safe snapshot mailbox: the core thread computes fresh DeviceRowViews (ui/base.py) and
-publishes them; this module's render loop only ever reads the latest published list,
-never touching live scanner/Device/Service state directly.
+DPG is strictly synchronous and must run on the main thread, but the core
+(scanner.py) is asyncio-only, so CoreBridge runs it on its own background
+thread with its own event loop. UI-triggered work (button clicks, form
+submits) crosses into that loop via asyncio.run_coroutine_threadsafe. State
+flows the other way through a thread-safe snapshot mailbox: the core thread
+computes fresh DeviceRowViews (ui/base.py) and publishes them; this module's
+render loop only reads the latest published list, never touching live
+scanner/Device/Service state directly.
 
-DearPyGui callbacks always arrive as (sender, app_data, user_data) - there's no slot
-for extra arguments - so the one piece of state this module keeps at module level is
-`_bridge`, set once by main(). Every "normal" (non-callback) function here still takes
-the bridge as an explicit parameter rather than reaching for that global; only the
-callbacks DearPyGui itself invokes fall back to it, because they have no choice.
+DearPyGui callbacks always arrive as (sender, app_data, user_data), with no
+slot for extra arguments - so the one piece of module-level state here is
+`_bridge`, set once by main(). Every non-callback function still takes the
+bridge as an explicit parameter; only the callbacks DearPyGui itself invokes
+fall back to the global, since they have no choice.
 """
 from __future__ import annotations
 
@@ -204,12 +205,13 @@ def _format_sources_badge(sources: set[str]) -> str:
 
 
 def _invisible_grid():
-    """A two-column dpg.table with every grid line disabled - structural alignment
-    (a fixed-width label/source column, a stretching value/name column) without any
-    visible table chrome. Caller must add the column pair (_add_grid_columns) first,
-    then rows via `with dpg.table_row():` blocks. Must not be used as the direct
-    parent of a spacer or anything else that isn't a row/column - DPG only accepts
-    mvTableRow/mvTableColumn as a table's direct children."""
+    """A two-column dpg.table with every grid line disabled - structural
+    alignment (a fixed-width label/source column, a stretching value/name
+    column) with no visible table chrome. Caller must add the column pair
+    (_add_grid_columns) first, then rows via `with dpg.table_row():`. Must
+    not be used as the direct parent of a spacer or anything else that
+    isn't a row/column - DPG only accepts mvTableRow/mvTableColumn as a
+    table's direct children."""
     return dpg.table(header_row=False, borders_innerH=False, borders_innerV=False,
                       borders_outerH=False, borders_outerV=False)
 
@@ -226,11 +228,11 @@ _right_aligned_key_theme = None
 
 
 def _get_right_aligned_key_theme():
-    """Right-aligns via ImGui's native SelectableTextAlign style var rather than a
-    manually measured indent, so alignment is computed by the renderer itself from
-    the actual current font/DPI on every frame instead of a get_text_size()
-    estimate taken once. Selection highlighting is disabled since these labels
-    aren't interactive."""
+    """Right-aligns via ImGui's native SelectableTextAlign style var rather
+    than a manually measured indent, so alignment is computed by the
+    renderer from the current font/DPI every frame instead of a one-off
+    get_text_size() estimate. Selection highlighting is disabled since
+    these labels aren't interactive."""
     global _right_aligned_key_theme
     if _right_aligned_key_theme is None:
         with dpg.theme() as _right_aligned_key_theme:
@@ -253,14 +255,12 @@ def _add_right_aligned_text(text: str):
 
 
 def _add_selectable_value(value: str, width: int = -1):
-    """A read-only input field standing in for plain text wherever a displayed
-    value (a TXT record's value, an IP address, ...) is something a user might
-    want to copy - unlike dpg.add_text, DPG/ImGui's InputText natively supports
-    click-drag selection (highlighted via the theme's existing TextSelectedBg
-    color) and Ctrl+C, with no extra wiring needed. auto_select_all means a single
-    click already selects the whole value - ready to copy immediately - rather
-    than requiring a drag across it first. width=-1 (the default) stretches to
-    fill the available column width."""
+    """A read-only input field standing in for plain text wherever a
+    displayed value (a TXT record's value, an IP address, ...) might need
+    copying - unlike dpg.add_text, InputText natively supports click-drag
+    selection and Ctrl+C. auto_select_all means a single click selects the
+    whole value, ready to copy, rather than requiring a drag across it.
+    width=-1 (default) fills the available column width."""
     return dpg.add_input_text(default_value=value, readonly=True, width=width, auto_select_all=True)
 
 
@@ -339,12 +339,14 @@ def build_ui():
 # ----------------------------------------------------------------------------------
 
 class CoreBridge:
-    """Owns the async core on its own background thread/event loop. The only
-    cross-thread state is deliberately narrow: which device ips are expanded (the DPG
-    thread writes, the core thread reads - it needs to know before deciding whether
-    building a device's category_tabs, and the fetches doing so can trigger, is
-    warranted; see build_device_row_view's docstring) and the latest published
-    DeviceRowView snapshot (the core thread writes, the DPG thread reads)."""
+    """Owns the async core on its own background thread/event loop.
+
+    Cross-thread state is deliberately narrow: which device ips are
+    expanded (the DPG thread writes, the core thread reads - it needs to
+    know before deciding whether building category_tabs, and the fetches
+    that can trigger, is warranted; see build_device_row_view's docstring)
+    and the latest published DeviceRowView snapshot (the core thread
+    writes, the DPG thread reads)."""
 
     def __init__(self, scanner_factory=NetworkScanner):
         self._scanner_factory = scanner_factory
@@ -519,11 +521,11 @@ def _on_device_toggle_click(sender, app_data, ip: str):
 
 
 def _on_save_click(sender, app_data, user_data):
-    """Writes every currently-known device's data to a JSON file - whatever's in
-    _last_rendered_views, the same snapshot already on screen, not a fresh
-    forced-expand of every device: that would trigger the exact eager,
-    unprompted fetches (e.g. anonymous SMB auth against every device, not just
-    ones the user actually opened) lazy loading exists to prevent."""
+    """Writes every currently-known device's data to a JSON file - whatever's
+    in _last_rendered_views, the same snapshot already on screen, not a
+    fresh forced-expand that would trigger the eager, unprompted fetches
+    (e.g. anonymous SMB auth against every device) lazy loading exists to
+    prevent."""
     save_devices_to_json(_last_rendered_views)
     dpg.set_value("save_status", f"Saved {len(_last_rendered_views)} device(s) to {DEFAULT_SAVE_PATH}")
 
@@ -542,12 +544,12 @@ def _tab_tag(ip: str, tab_id: str) -> str:
 
 
 def _on_tab_changed(sender, app_data, ip: str):
-    """Fires whenever the active tab changes for one device's tab_bar - both from a
-    user's own click and from build_device_row's own dpg.set_value call enforcing a
-    requested tab (harmlessly redundant in that case: it just re-records the same
-    value). Recording it here is what makes a manual tab switch "stick" across a
-    later unrelated refresh, which would otherwise rebuild this row from scratch and
-    silently land back on Names."""
+    """Fires whenever the active tab changes for one device's tab_bar - both
+    from a user click and from build_device_row's own dpg.set_value call
+    enforcing a requested tab (harmlessly redundant there: it re-records the
+    same value). Recording it here makes a manual tab switch "stick" across
+    a later refresh, which would otherwise rebuild this row and land back
+    on Names."""
     tab_id = app_data.removeprefix(f"tab::{ip}::")
     _view_state.set_active_tab(ip, tab_id)
 
@@ -652,11 +654,11 @@ _COLLAPSE_ALL_LABEL = "Collapse All"
 
 
 def _on_toggle_all_properties_click(sender, app_data, user_data):
-    """collapsing_header has no callback, but does support get_value/set_value like
-    a bool-valued widget, so this applies directly to what's on screen instead of
-    forcing a rebuild, and updates _view_state so a later unrelated refresh
-    remembers it. Reconfigures `sender` (the button itself) so its own label/next
-    action flips immediately too."""
+    """collapsing_header has no callback, but does support get_value/set_value
+    like a bool-valued widget, so this applies directly to what's on screen
+    instead of forcing a rebuild, and updates _view_state so a later refresh
+    remembers it. Reconfigures `sender` (the button itself) so its
+    label/next action flips immediately too."""
     ip, section_ids, expand = user_data
     for section_id in section_ids:
         tag = _properties_section_tag(ip, section_id)
@@ -668,16 +670,20 @@ def _on_toggle_all_properties_click(sender, app_data, user_data):
 
 
 def _add_properties_tab(dev_view: DeviceRowView):
-    """Raw mDNS TXT records, one collapsing section per service, defaulting to
-    closed - this tab gets long, and Expand All/Collapse All (top right) toggles
-    every section on this device at once. Each section's open/closed state is
-    tracked in _view_state and reapplied via default_open on every rebuild, since
-    collapsing_header has no callback to hook (see _snapshot_properties_expanded).
+    """Raw mDNS TXT records, one collapsing section per service, defaulting
+    to closed - this tab gets long, and Expand All/Collapse All (top right)
+    toggles every section at once.
 
-    A service with nothing to show (no properties at all, or only blank-decoded
-    keys) is skipped entirely, header included. Physical Devices only ever has
-    anything to show for this machine's own row (see Device.physical_interfaces),
-    so it's skipped just as completely for every other device."""
+    Each section's open/closed state is tracked in _view_state and
+    reapplied via default_open on every rebuild, since collapsing_header
+    has no callback to hook (see _snapshot_properties_expanded).
+
+    A service with nothing to show (no properties, or only blank-decoded
+    keys) is skipped entirely, header included. Physical Devices only has
+    anything to show for this machine's own row (see
+    Device.physical_interfaces), so it's skipped for every other device.
+    Finders always renders - Not Found is exactly as informative as
+    Found."""
     section_ids = properties_section_ids(dev_view.properties)
     with dpg.tab(label="Properties", tag=_tab_tag(dev_view.ip, PROPERTIES_TAB_ID)):
         with dpg.table(header_row=False, borders_innerH=False, borders_innerV=False,
@@ -699,6 +705,17 @@ def _add_properties_tab(dev_view: DeviceRowView):
                 )
 
         shown = 0
+        dpg.add_spacer(height=8)
+        shown += 1
+        with dpg.collapsing_header(
+            label="Finders", tag=_properties_section_tag(dev_view.ip, "finders"),
+            default_open=_view_state.is_properties_section_expanded(dev_view.ip, "finders"),
+        ):
+            _add_key_value_grid([
+                (finder.label, "Found" if finder.found else "Not Found")
+                for finder in dev_view.properties.finders
+            ])
+
         if dev_view.properties.physical_devices:
             dpg.add_spacer(height=8)
             shown += 1
@@ -734,15 +751,16 @@ def _add_identity_line(dev_view: DeviceRowView) -> None:
 
 
 def _add_names_tab(dev_view: DeviceRowView):
-    """The expanded view's first tab: identity (icon, hostname, aliases), labeled
-    with the device's own current hostname. About *which device this is*, not what
-    you can do with it - actions live in the category tabs alongside this one.
+    """The expanded view's first tab: identity (icon, hostname, aliases),
+    labeled with the device's current hostname. About which device this is,
+    not what you can do with it - actions live in the category tabs
+    alongside this one.
 
-    Provenance (which discovery source reported a name) is a visible left-column
-    badge, not a hover tooltip - a grid, not a flat list, so the reader never has
-    to hover just to see where a name came from. The hostname row's name gets the
-    bright/bold theme, alias rows stay muted, matching the collapsed row's
-    icon+hostname line."""
+    Provenance (which discovery source reported a name) is a visible
+    left-column badge, not a hover tooltip - a grid, not a flat list, so the
+    reader never has to hover to see where a name came from. The hostname
+    row's name gets the bright/bold theme, alias rows stay muted, matching
+    the collapsed row's icon+hostname line."""
     with dpg.tab(label=dev_view.hostname, tag=_tab_tag(dev_view.ip, NAMES_TAB_ID)):
         names = dev_view.names
         with _invisible_grid():
@@ -770,26 +788,27 @@ def _row_tag(ip: str) -> str:
 
 
 def build_device_row(dev_view: DeviceRowView, bridge: CoreBridge, before: int | str = 0) -> None:
-    """The whole per-device row: a disclosure arrow in the table's narrow first
-    column, sitting directly left of the device's name, and everything else in the
-    wide second column.
+    """The whole per-device row: a disclosure arrow in the table's narrow
+    first column, sitting left of the device's name, and everything else in
+    the wide second column.
 
-    Collapsed (the default): one horizontal line - icon, hostname, (IP), then every
-    service's immediate action buttons, flowing left to right. Cheap to draw and
+    Collapsed (the default): one horizontal line - icon, hostname, (IP),
+    then every service's immediate action buttons. Cheap to draw and
     triggers no fetches.
 
-    Expanded: a dpg.tab_bar. Its first tab is Names (identity - see
-    _add_names_tab), then one tab per ResourceCategory that has a matching service on
-    this device (in ResourceCategory's definition order), and a Properties tab last,
-    dumping every service's raw mDNS TXT records. Which tab is active is enforced
-    after building all of them, from _view_state.active_tab - either a category
-    requested via a [View <Category>] button, or whichever tab the user last
-    switched to manually (see _on_tab_changed); defaults to Names.
+    Expanded: a dpg.tab_bar. Its first tab is Names (see _add_names_tab),
+    then one tab per ResourceCategory with a matching service on this
+    device (in definition order), then Properties last, dumping every
+    service's raw mDNS TXT records. Which tab is active is enforced after
+    building all of them, from _view_state.active_tab - either a category
+    requested via a [View <Category>] button, or whichever tab the user
+    last switched to manually (see _on_tab_changed); defaults to Names.
 
-    Reads entirely from dev_view (ui/base.py's DeviceRowView) - never touches a live
-    Device/Service, since those live on the core thread. Tagged with _row_tag(ip) and
-    placed at `before` (another row's tag, or 0 to append) so refresh_table can
-    delete and reinsert just this one row in place instead of the whole table."""
+    Reads entirely from dev_view (ui/base.py's DeviceRowView) - never
+    touches a live Device/Service, since those live on the core thread.
+    Tagged with _row_tag(ip) and placed at `before` (another row's tag, or
+    0 to append) so refresh_table can delete and reinsert just this one row
+    in place instead of the whole table."""
     is_open = bridge.is_expanded(dev_view.ip)
     with dpg.table_row(parent="device_list", tag=_row_tag(dev_view.ip), before=before):
         dpg.add_button(label="▼" if is_open else "▶", small=True,
@@ -819,21 +838,22 @@ def build_device_row(dev_view: DeviceRowView, bridge: CoreBridge, before: int | 
 
 
 def refresh_table(bridge: CoreBridge) -> None:
-    """Rebuilds only the rows whose rendered content actually changed since the last
-    publish, not the whole device_list - scanner.dirty (see scanner.py) flips on any
-    background discovery activity anywhere on the network, not just on the device a
-    user is actually looking at, so wiping and rebuilding every row on every tick used
-    to tear down and recreate whatever row was expanded or mid-login far more often
-    than its own content ever changed - losing focus, tab-hover, and other transient
-    DPG widget state each time, which read as flicker.
+    """Rebuilds only the rows whose rendered content actually changed since
+    the last publish, not the whole device_list. scanner.dirty (see
+    scanner.py) flips on any background discovery activity anywhere on the
+    network, not just the device a user is looking at, so rebuilding every
+    row on every tick used to tear down whatever row was expanded or
+    mid-login far more often than its content actually changed - losing
+    focus, tab-hover, and other transient DPG widget state, which read as
+    flicker.
 
-    Devices are only ever appended to NetworkScanner.devices, never reordered or
-    removed (see scanner.py) - so an unchanged row's position never needs to move.
-    Walking `views` back-to-front and reinserting only changed/new rows `before` the
-    next row's tag works because, by induction, that next row is already at its
-    correct final position by the time it's used as an anchor: either it was never
-    touched, or - since it's processed earlier in this same backward pass - it was
-    already rebuilt there itself."""
+    Devices are only ever appended to NetworkScanner.devices, never
+    reordered or removed (see scanner.py), so an unchanged row's position
+    never needs to move. Walking `views` back-to-front and reinserting only
+    changed/new rows `before` the next row's tag works because, by
+    induction, that next row is already at its correct final position:
+    either untouched, or already rebuilt there itself earlier in this same
+    backward pass."""
     global _last_rendered_views, _last_rendered_expanded
     version, views = bridge.read_snapshot()
     if version == refresh_table.last_version:

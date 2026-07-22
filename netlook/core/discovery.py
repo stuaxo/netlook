@@ -1,24 +1,23 @@
 """Discovery engines: independent strategies for finding candidate hosts on the
-local network and feeding them back to a scanner context. NetworkScanner (scanner.py)
-is the only thing that knows how a target becomes a Device/Service - engines here
-only ever call the narrow ScannerContext interface, never touch Device/Service
-directly, and have zero dependency on dearpygui.
+local network and feeding them to a scanner context.
+
+NetworkScanner (scanner.py) is the only thing that knows how a target becomes
+a Device/Service - engines here only call the narrow ScannerContext interface,
+never touch Device/Service directly, and have no dependency on dearpygui.
 
 Two shapes of target flow through that interface:
-  - A live mDNS service (MdnsDiscovery): full protocol detail (type, port, txt
-    records) via `scanner_ctx.discover_mdns_service(zc, type_, name)`.
-  - A bare candidate host (SshKnownHostsDiscovery, EtcHostsDiscovery): just an IP and
-    maybe a name, via `scanner_ctx.queue_probe(ip, hostname, source)` - the scanner's
-    existing port-probing (ssh/rdp/incus/cups/vnc/moonlight/...) takes it from there.
+  - A live mDNS service (MdnsDiscovery): full protocol detail via
+    `scanner_ctx.discover_mdns_service(zc, type_, name)`.
+  - A bare candidate host (SshKnownHostsDiscovery, EtcHostsDiscovery): an IP
+    and maybe a name, via `scanner_ctx.queue_probe(ip, hostname, source)` -
+    the scanner's existing port probing takes it from there.
 
-Everything here runs on a single asyncio event loop - see scanner.py's module
-docstring for why that means no locking is needed for state these engines share with
-the scanner. One thing worth knowing: zeroconf's AsyncServiceBrowser still fires its
-ServiceListener handlers (add_service/update_service) *synchronously* from the event
-loop, not by awaiting them (confirmed by reading zeroconf's own dispatch code - it's
-a plain Signal.fire(), not coroutine-aware) - so those handlers stay regular
-functions that schedule the real async work via asyncio.create_task() rather than
-awaiting it inline.
+Everything runs on a single asyncio event loop (see scanner.py's module
+docstring), so no locking is needed for shared state. Note: zeroconf's
+AsyncServiceBrowser fires ServiceListener handlers (add_service/
+update_service) synchronously, not as coroutines - a plain Signal.fire(), not
+awaited - so those handlers just schedule the real async work via
+asyncio.create_task() instead of awaiting it inline.
 """
 from __future__ import annotations
 
@@ -81,9 +80,8 @@ class DiscoveryEngine:
 
 
 class _TypeListener(ServiceListener):
-    """Feeds newly-discovered service *type* strings back to the owning
-    MdnsDiscovery, so it can start browsing them too - lets us pick up service types
-    beyond the SERVICE_TYPES list as they're announced on the network."""
+    """Feeds newly-discovered service *type* strings back to MdnsDiscovery, so
+    it can browse types beyond the SERVICE_TYPES list as they're announced."""
 
     def __init__(self, discovery: "MdnsDiscovery"):
         self.discovery = discovery
@@ -102,6 +100,13 @@ class MdnsDiscovery(DiscoveryEngine, ServiceListener):
     """Wraps zeroconf's AsyncServiceBrowser/ServiceListener machinery. Live,
     continuous - stop() closes the AsyncZeroconf instance, which tears down its
     background listeners."""
+
+    # Unlike the other engines' SOURCE, never attached to a name in
+    # Device.names (discover_mdns_service tags names with the reporting
+    # service's own kind, e.g. "ssh" - see models._NON_MDNS_NAME_SOURCES).
+    # Only used as this engine's identity in FINDER_SOURCES/Device.found_by,
+    # the Properties tab's "Finders" section.
+    SOURCE = "mdns"
 
     def __init__(self, service_types: list[str] | None = None):
         self.service_types = service_types or SERVICE_TYPES
@@ -159,11 +164,11 @@ _WSD_GET_ENVELOPE = """<?xml version="1.0" encoding="UTF-8"?>
 
 
 async def _fetch_wsd_friendly_name(xaddr: str) -> str | None:
-    """Best-effort WS-Transfer "Get" against a WSD device's own XAddr - the metadata
-    exchange step (part of the Devices Profile for Web Services, not plain WS-
-    Discovery) that Windows Explorer's Network view and Samba's wsdd both use to turn
-    an endpoint UUID into an actual computer name. Returns None on any failure -
-    WsdDiscovery falls back to the EPR when this doesn't pan out."""
+    """Best-effort WS-Transfer "Get" against a WSD device's XAddr - the metadata
+    exchange step (Devices Profile for Web Services, not plain WS-Discovery)
+    that Windows Explorer and Samba's wsdd both use to turn an endpoint UUID
+    into a computer name. Returns None on failure; WsdDiscovery falls back to
+    the EPR."""
     parsed = urlparse(xaddr)
     if not parsed.hostname:
         return None
@@ -190,22 +195,20 @@ async def _fetch_wsd_friendly_name(xaddr: str) -> str | None:
 
 
 async def _pick_address(xaddrs: list[str]) -> tuple[str, str] | None:
-    """A WSD service can list several XAddrs for the same single endpoint - commonly
-    an IPv6 link-local address alongside the real LAN IP. Probing every one of them
-    would turn one physical device into several duplicate rows (and the link-local
-    ones, lacking a scope id, are rarely even reachable), so this picks a single best
-    address instead: prefer IPv4, skip link-local, fall back to whatever's left.
-    Returns (ip, xaddr) for the chosen address, or None if nothing usable was found.
+    """Picks one best address from a WSD service's XAddrs.
 
-    Always returns a literal IP, never a raw hostname: some WSD responders (Samba's
-    wsdd, at least) advertise an XAddr with their bare hostname instead of an IP
-    (e.g. "http://werner:5357/..."). Treating that hostname string as if it were
-    the ip would key the resulting Device by "werner" instead of a real address,
-    which can never merge with the same physical host found via another discovery
-    engine (mDNS/smb reporting the same machine keyed by its actual IP). A
-    hostname-only XAddr is resolved via _resolve_local_hostname as a last resort
-    instead, only once no IP-literal XAddr is available; if resolution fails too,
-    it's dropped rather than queued with a broken address."""
+    A WSD service can list several XAddrs for the same endpoint - commonly an
+    IPv6 link-local address alongside the real LAN IP. Probing all of them
+    would create duplicate rows for one device, so this prefers IPv4, skips
+    link-local, and falls back to whatever's left. Returns (ip, xaddr), or
+    None if nothing usable was found.
+
+    Always returns a literal IP, never a raw hostname: some WSD responders
+    (Samba's wsdd) advertise a bare hostname instead (e.g.
+    "http://werner:5357/..."). Keying the Device by that hostname would stop
+    it merging with the same host found via mDNS/smb, which key by IP. A
+    hostname-only XAddr is resolved via _resolve_local_hostname as a last
+    resort; if that fails too, it's dropped."""
     ip_candidates = []
     hostname_candidates = []
     for xaddr in xaddrs:
@@ -233,12 +236,12 @@ async def _pick_address(xaddrs: list[str]) -> tuple[str, str] | None:
 
 
 class WsdDiscovery(DiscoveryEngine):
-    """Web Services Discovery (WSD) - how modern Windows machines and Samba (running
-    wsdd) advertise themselves, since neither speaks mDNS. wsdiscovery has no async
-    API of its own (its async.py module says so directly: "planned", not built) -
-    WSDiscovery.searchServices() is a blocking, one-shot probe-and-collect call, so
-    each poll offloads it to a worker thread via asyncio.to_thread() rather than
-    blocking the event loop, while the polling itself is a native asyncio task."""
+    """Web Services Discovery (WSD) - how Windows machines and Samba (wsdd)
+    advertise themselves, since neither speaks mDNS.
+
+    wsdiscovery has no async API of its own (searchServices() is a blocking,
+    one-shot call), so each poll runs it in a worker thread via
+    asyncio.to_thread(); the polling loop itself is a native asyncio task."""
 
     SOURCE = "WSD"
     POLL_INTERVAL = 60  # seconds between re-probes, to notice devices that join later
@@ -259,16 +262,12 @@ class WsdDiscovery(DiscoveryEngine):
         if self._task:
             self._task.cancel()
         if self._wsd:
-            # ThreadedWSDiscovery.stop() joins its own internal networking/address-
-            # monitor threads synchronously, which - since those threads poll on a
-            # ~1s interval - makes stop() itself block for about that long. Those
-            # threads are already daemons (wsdiscovery's own _StoppableDaemonThread),
-            # so nothing leaks if the process exits before this finishes; not worth
-            # making our own shutdown (and the whole app quitting on Escape/close)
-            # wait on a foreign library's teardown pace, especially right after
-            # start() when a searchServices() call may still be mid-flight in a
-            # to_thread worker (an in-progress time.sleep() that can't be cancelled
-            # either way).
+            # ThreadedWSDiscovery.stop() joins its internal threads synchronously,
+            # which blocks for about their ~1s poll interval. They're already
+            # daemon threads, so nothing leaks if the process exits first - not
+            # worth making our own shutdown wait on a foreign library's teardown,
+            # especially right after start() when searchServices() may still be
+            # mid-flight in a to_thread worker.
             threading.Thread(target=self._wsd.stop, daemon=True).start()
 
     async def _poll_loop(self) -> None:
@@ -304,14 +303,26 @@ async def _resolve_local_hostname(hostname: str) -> str | None:
         return None  # no .local resolver available (e.g. no avahi/nss-mdns) - skip it
 
 
+async def _resolve_reverse_hostname(ip: str) -> str | None:
+    """Best-effort PTR/reverse-mDNS lookup, so an address with no name of its
+    own (e.g. from ArpCacheDiscovery) can show as more than a bare IP.
+    nss-mdns wires this into gethostbyaddr() for .local addresses, same as
+    the forward lookup in _resolve_local_hostname."""
+    try:
+        name, _aliases, _ips = await asyncio.to_thread(socket.gethostbyaddr, ip)
+        return name
+    except OSError:
+        return None  # no reverse entry available - the caller falls back to the IP
+
+
 async def _parse_known_hosts(path: Path) -> AsyncIterator[tuple[str, str | None]]:
     """Yields (ip, hostname) for unhashed .local hostnames and local IPs in an
-    OpenSSH known_hosts file. Hashed entries (HashKnownHosts, the default on most
-    distros) can't be reversed, so lines starting with "|" are silently skipped -
-    only entries ssh stored in plaintext are usable here. The file read itself stays
-    a plain synchronous call - a one-shot, negligible-cost startup read, not worth
-    asyncio.to_thread ceremony - but resolving a .local hostname is a real (if
-    usually fast) network round-trip, so that part is properly async."""
+    OpenSSH known_hosts file. Hashed entries (HashKnownHosts, the default on
+    most distros) can't be reversed, so lines starting with "|" are skipped.
+
+    The file read is a plain synchronous call - negligible-cost, one-shot,
+    not worth asyncio.to_thread. Resolving a .local hostname is a real
+    network round-trip though, so that part is async."""
     try:
         text = path.read_text(errors="replace")
     except OSError:
@@ -347,11 +358,11 @@ class SshKnownHostsDiscovery(DiscoveryEngine):
 
 
 def _parse_etc_hosts(path: Path) -> list[tuple[str, str]]:
-    """Returns (ip, alias) pairs for each non-loopback, local /etc/hosts line - one
-    pair per alias, since a line can list several names for the same IP. Stays a
-    plain synchronous function (a one-shot, negligible-cost startup read, same
-    reasoning as _parse_known_hosts) - unlike known_hosts there's no per-entry
-    network resolution here, so there's no async work to yield control around."""
+    """Returns (ip, alias) pairs for each non-loopback, local /etc/hosts line -
+    one pair per alias, since a line can list several names for one IP.
+
+    Synchronous like _parse_known_hosts, but simpler: no per-entry resolution
+    here, so nothing async to yield control around."""
     try:
         text = path.read_text(errors="replace")
     except OSError:
@@ -389,3 +400,62 @@ class EtcHostsDiscovery(DiscoveryEngine):
     async def start(self, scanner_ctx: ScannerContext) -> None:
         for ip, alias in _parse_etc_hosts(self.path):
             await scanner_ctx.queue_probe(ip, alias, source=self.SOURCE)
+
+
+def _parse_arp_cache(path: Path) -> list[str]:
+    """Returns local IPv4 addresses with a complete (link-layer-resolved) entry
+    in the Linux kernel's ARP cache (/proc/net/arp), e.g.
+    "192.168.1.253  0x1  0x2  9c:bf:0d:00:f2:db  *  eth0". Incomplete entries
+    (flags "0x0", zero hardware address - no reply from the address) are
+    skipped. Returns [] on any read failure, including the file not existing
+    on non-Linux platforms."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return []
+    addresses = []
+    for line in lines[1:]:  # header row: "IP address  HW type  Flags  HW address ..."
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        ip_text, flags, hw_addr = parts[0], parts[2], parts[3]
+        if flags == "0x0" or hw_addr == "00:00:00:00:00:00":
+            continue
+        if _is_local(ip_text):
+            addresses.append(ip_text)
+    return addresses
+
+
+class ArpCacheDiscovery(DiscoveryEngine):
+    """One-shot: reads the Linux kernel's ARP cache (/proc/net/arp) at start()
+    and queues local, link-layer-resolved addresses for probing.
+
+    Catches hosts the machine has already exchanged packets with (a prior
+    ping or ssh session), even when they never announce via mDNS/WSD and
+    aren't in known_hosts or /etc/hosts - a device that only answers plain
+    A-record queries, with no service records, is otherwise invisible to
+    MdnsDiscovery. Linux-only: /proc/net/arp doesn't exist elsewhere, so this
+    quietly finds nothing there."""
+
+    SOURCE = "arp-cache"
+
+    def __init__(self, path: Path | None = None):
+        self.path = path or Path("/proc/net/arp")
+
+    async def start(self, scanner_ctx: ScannerContext) -> None:
+        for ip in _parse_arp_cache(self.path):
+            hostname = await _resolve_reverse_hostname(ip)
+            await scanner_ctx.queue_probe(ip, hostname, source=self.SOURCE)
+
+
+# (display label, SOURCE) for every engine, in the same order NetworkScanner's
+# _default_discovery_engines lists them - the Properties tab's "Finders" section
+# (Device.found_by, populated in scanner.py's queue_probe/discover_mdns_service)
+# renders exactly this list, one Found/Not Found row per entry, for every device.
+FINDER_SOURCES: list[tuple[str, str]] = [
+    ("mDNS", MdnsDiscovery.SOURCE),
+    ("SSH known_hosts", SshKnownHostsDiscovery.SOURCE),
+    ("/etc/hosts", EtcHostsDiscovery.SOURCE),
+    ("WSD", WsdDiscovery.SOURCE),
+    ("ARP cache", ArpCacheDiscovery.SOURCE),
+]

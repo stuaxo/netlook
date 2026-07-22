@@ -1,19 +1,18 @@
-"""The network engine: NetworkScanner is the centralized orchestrator - it owns the
-Device tree and a list of DiscoveryEngine instances (discovery.py) that feed it
-candidate hosts. It also does the active port-probing/protocol verification itself,
-since that's shared infrastructure every discovery engine's targets flow through, not
-a "discovery strategy" of its own.
+"""The network engine: NetworkScanner is the central orchestrator. It owns
+the Device tree and a list of DiscoveryEngine instances (discovery.py) that
+feed it candidate hosts, and does the active port-probing/protocol
+verification itself, since that's shared infrastructure every engine's
+targets flow through.
 
-No UI toolkit dependency, and (since discovery.py owns all zeroconf usage) no direct
-zeroconf dependency either - only stdlib, httpx, and models.py.
+No UI toolkit dependency. No direct zeroconf dependency either - discovery.py
+owns all zeroconf usage - just stdlib, httpx, and models.py.
 
-Everything here runs on a single asyncio event loop, so - unlike the old threaded
-version - there's no lock anywhere: a coroutine only yields control at an `await`, so
-any synchronous check-then-mutate sequence with no `await` in between (every
-mutation in this file, and in Device.add_service/add_alias) is already atomic. A
-frontend that needs to read this scanner's state from a *different* thread (a
-synchronous UI toolkit bridging into this event loop) is responsible for its own
-cross-thread synchronization at that boundary - not this module's concern.
+Everything runs on a single asyncio event loop, so there's no lock anywhere:
+a coroutine only yields control at an `await`, so any synchronous
+check-then-mutate sequence with no `await` in between is already atomic. A
+frontend reading this scanner's state from a different thread (a synchronous
+UI toolkit bridging into this event loop) is responsible for its own
+cross-thread synchronization - not this module's concern.
 """
 from __future__ import annotations
 
@@ -26,23 +25,29 @@ import xml.etree.ElementTree as ET
 import httpx
 import psutil
 
-from .discovery import DiscoveryEngine, EtcHostsDiscovery, MdnsDiscovery, SshKnownHostsDiscovery, WsdDiscovery
+from .discovery import (
+    ArpCacheDiscovery,
+    DiscoveryEngine,
+    EtcHostsDiscovery,
+    MdnsDiscovery,
+    SshKnownHostsDiscovery,
+    WsdDiscovery,
+)
 from .models import Device, Fetchable, FetchState, Service, kind_from_type
 
 
 def _detect_local_network() -> tuple[set[str], str]:
     """Every IPv4 address bound to a local interface (including loopback), and
-    which one to treat as canonical - the address other devices on the LAN would
-    actually use to reach this machine. Used to recognize a discovered device as
-    *this* machine itself, so it collapses into one Device entry instead of a
-    separate row per interface it happens to be reachable at (e.g. its LAN address
-    and 127.0.0.1 showing up as two unrelated devices).
+    which one to treat as canonical - the address other devices on the LAN
+    would use to reach this machine.
 
-    0.0.0.0 is excluded even though psutil.net_if_addrs() doesn't normally report
-    it (it reports addresses actually bound to an interface, not wildcard bind
-    addresses) - a misconfigured or transitional interface on some system could
-    still report it, and it's not a genuine, connectable identity of this machine
-    the way 127.0.0.1 or a LAN address is."""
+    Used to recognise a discovered device as this machine, so it collapses
+    into one Device entry instead of a row per interface (e.g. LAN address
+    and 127.0.0.1 as two unrelated devices).
+
+    0.0.0.0 is excluded even though psutil.net_if_addrs() doesn't normally
+    report it - a misconfigured interface could still report it, and it's
+    not a genuine connectable identity of this machine."""
     local_ips = {"127.0.0.1"}
     for addrs in psutil.net_if_addrs().values():
         for addr in addrs:
@@ -69,11 +74,11 @@ _NULL_MAC = "00:00:00:00:00:00"
 
 
 def _detect_local_physical_interfaces() -> list[tuple[str, str]]:
-    """This machine's own network interfaces that have a real hardware (MAC)
-    address - (interface name, mac) pairs, e.g. [("wlp192s0", "6e:3a:...")].
-    Loopback always reports psutil.AF_LINK too, but with the null MAC
-    00:00:00:00:00:00 - excluded here since it's a virtual interface, not a
-    physical device."""
+    """This machine's network interfaces with a real hardware (MAC) address -
+    (interface name, mac) pairs, e.g. [("wlp192s0", "6e:3a:...")].
+
+    Loopback reports psutil.AF_LINK too, but with the null MAC
+    00:00:00:00:00:00 - excluded since it's virtual, not a physical device."""
     interfaces = []
     for name, addrs in psutil.net_if_addrs().items():
         mac = next((a.address for a in addrs if a.family == psutil.AF_LINK and a.address), None)
@@ -241,7 +246,13 @@ def _split_addresses(addresses: list) -> tuple:
 
 
 def _default_discovery_engines() -> list[DiscoveryEngine]:
-    return [MdnsDiscovery(), SshKnownHostsDiscovery(), EtcHostsDiscovery(), WsdDiscovery()]
+    return [
+        MdnsDiscovery(),
+        SshKnownHostsDiscovery(),
+        EtcHostsDiscovery(),
+        WsdDiscovery(),
+        ArpCacheDiscovery(),
+    ]
 
 
 class NetworkScanner:
@@ -263,19 +274,17 @@ class NetworkScanner:
             else _detect_local_physical_interfaces()
 
     def _canonicalize_ip(self, ip: str) -> str:
-        """Maps any of this machine's own interface addresses to _local_canonical_ip,
-        so probing/discovery for this box - reachable at several different
-        addresses - collapses into a single Device entry via the existing
-        devices.setdefault(ip, ...) pattern, rather than a separate row per
-        interface."""
+        """Maps any of this machine's interface addresses to
+        _local_canonical_ip, so this box - reachable at several addresses -
+        collapses into a single Device entry via devices.setdefault(ip, ...)
+        rather than a row per interface."""
         return self._local_canonical_ip if ip in self._local_ips else ip
 
     async def start(self) -> None:
-        # Pre-seed this machine's own entry with "localhost" as a name, so it's
-        # present (and recognizable) even before any discovery engine or probe
-        # reports anything about it - and so a nicer name discovered later (e.g.
-        # this box's own _device-info._tcp) promotes over "localhost" without
-        # losing it, exactly like any other alias.
+        # Pre-seed this machine's entry with "localhost", so it's present
+        # before any discovery engine reports anything - a nicer name found
+        # later (e.g. this box's own _device-info._tcp) promotes over it
+        # without losing it, like any other alias.
         self.devices.setdefault(
             self._local_canonical_ip,
             Device("localhost", self._local_canonical_ip, names={"localhost": {"localhost"}},
@@ -300,12 +309,12 @@ class NetworkScanner:
         return task
 
     async def request_items(self, service: Service, **kwargs) -> None:
-        """Kick off whatever async fetch a service's resources() needs before it can
-        yield its real actions (a share list, an instance list, ...). Unconditional -
-        goes ahead with exactly these kwargs regardless of fetch_state, since a
-        caller reaching for this (rather than ensure_fetched below) already knows it
-        wants a specific fetch to happen now, e.g. a credentialed retry after
-        AUTH_REQUIRED."""
+        """Kicks off whatever async fetch a service's resources() needs (a
+        share list, an instance list, ...).
+
+        Unconditional - runs regardless of fetch_state, since a caller
+        reaching for this rather than ensure_fetched already wants a
+        specific fetch now, e.g. a credentialed retry after AUTH_REQUIRED."""
         if service.loading:
             return
         service.loading = True
@@ -314,11 +323,10 @@ class NetworkScanner:
 
     async def ensure_fetched(self, service: Service) -> None:
         """Lazily triggers service.fetch() the first time something expresses
-        interest in it (e.g. a device row is expanded) - a no-op if that's already
-        been attempted. The caller only ever needs to say "I want this now";
-        whether that becomes a real fetch is entirely this scanner's own call,
-        based on the service's own fetch_state - keeps the network tree
-        self-sufficient rather than depending on a view layer to interpret it."""
+        interest (e.g. a device row expands) - a no-op if already attempted.
+
+        The caller just says "I want this now"; whether it becomes a real
+        fetch is this scanner's call, based on fetch_state."""
         if isinstance(service, Fetchable) and service.fetch_state == FetchState.NOT_FETCHED:
             await self.request_items(service)
 
@@ -327,25 +335,28 @@ class NetworkScanner:
         self.dirty = True
 
     async def wait_idle(self) -> None:
-        """Waits for every currently-tracked background task (probes, fetches) to
-        finish. request_items()/_ensure_probed() schedule their work rather than
-        awaiting it directly - by design, so a caller is never blocked on a slow
-        fetch - so this is how a caller that *does* need the result (a test wanting
-        to observe a scheduled fetch's effect deterministically, without guessing at
-        a sleep duration) can wait for it to actually land."""
+        """Waits for every tracked background task (probes, fetches) to finish.
+
+        request_items()/_ensure_probed() schedule work rather than awaiting
+        it, so a caller is never blocked on a slow fetch. This is how a
+        caller that does need the result (e.g. a test observing a scheduled
+        fetch deterministically) can wait for it to land."""
         tasks = [t for t in self._tasks if not t.done()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def queue_probe(self, ip: str, hostname: str | None = None, source: str = "") -> None:
-        """ScannerContext entry point for discovery engines that only know "here's a
-        candidate host" (ssh known_hosts, /etc/hosts, ...), as opposed to mDNS's full
-        service detail. Registers the target (and its name, tagged with `source` for
-        the provenance tooltips) and schedules its one-time port probe."""
+        """ScannerContext entry point for discovery engines that only know
+        "here's a candidate host" (ssh known_hosts, /etc/hosts, ...), unlike
+        mDNS's full service detail. Registers the target and name (tagged
+        with `source` for provenance tooltips) and schedules its one-time
+        port probe."""
         ip = self._canonicalize_ip(ip)
         device = self.devices.setdefault(ip, Device(hostname or ip, ip, names={(hostname or ip): {source}}))
         if hostname:
             device.add_alias(source, hostname)
+        if source:
+            device.found_by.add(source)
         self.dirty = True
         await self._ensure_probed(ip)
 
@@ -368,20 +379,21 @@ class NetworkScanner:
         if ip6 and not device.ipv6:
             device.ipv6 = ip6
         device.add_service(type_, info.port, info.properties, discovered_name)
+        device.found_by.add(MdnsDiscovery.SOURCE)
         self.dirty = True
 
         await self._ensure_probed(ip)
 
     async def _ensure_probed(self, ip: str) -> None:
-        """Schedule a one-time port probe for `ip`, no matter which discovery engine
-        found it - "have we probed this yet" bookkeeping lives here so every engine's
-        targets flow through the same probing logic.
+        """Schedules a one-time port probe for `ip`, whichever engine found
+        it - "have we probed this yet" bookkeeping lives here so every
+        engine's targets flow through the same probing logic.
 
-        For this machine's own canonical entry specifically, also tries 127.0.0.1
-        as a connection target alongside the LAN address: a service bound
-        loopback-only (CUPS's own default, commonly) would never answer on the LAN
-        address at all, and would otherwise be invisible on this one device that's
-        supposed to represent the whole machine."""
+        For this machine's own canonical entry, also tries 127.0.0.1
+        alongside the LAN address: a loopback-only service (CUPS often
+        defaults to this) would never answer on the LAN address, and would
+        otherwise be invisible on the device meant to represent the whole
+        machine."""
         if ip in self.probed:
             return
         self.probed.add(ip)

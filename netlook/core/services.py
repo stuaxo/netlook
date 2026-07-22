@@ -36,12 +36,12 @@ HAS_SMBCLIENT = shutil.which("smbclient") is not None
 
 
 class SmbClientMissing(RuntimeError):
-    """Raised by list_smb_shares when the smbclient binary itself isn't installed -
-    deliberately distinct from both a genuinely empty listing ([], []) and an auth
-    failure (None), neither of which this is: we never even got to ask the server.
-    Conflating this with an empty listing used to make Samba.fetch report "no
-    shares found" for every device, forever, on a machine missing the package -
-    indistinguishable from a device that really has none."""
+    """Raised by list_smb_shares when the smbclient binary isn't installed.
+
+    Distinct from an empty listing ([], []) and an auth failure (None) - we
+    never even asked the server. Conflating this with an empty listing used
+    to make Samba.fetch report "no shares found" for every device on a
+    machine missing the package."""
 
 
 @dataclass
@@ -95,12 +95,13 @@ async def list_smb_shares(ip: str, username: str | None = None,
 
 
 def _smb_authority(ip: str, username: str | None) -> str:
-    """`user@host`, or just `host` if this fetch was anonymous. Only the username is
-    embedded - never the password: it would otherwise sit in plain sight in argv
-    (visible to any local user via `ps`) for the lifetime of the xdg-open process.
-    Carrying the username at least means the file manager's own auth prompt only
-    needs a password, not both, and most (GVfs-based) prompts offer to remember it
-    via the keyring after that."""
+    """`user@host`, or just `host` if this fetch was anonymous.
+
+    Only the username is embedded, never the password - it would sit in
+    plain sight in argv (visible via `ps`) for the life of the xdg-open
+    process. The file manager's own auth prompt then only needs a password,
+    and most GVfs-based prompts offer to remember it via the keyring after
+    that."""
     auth = f"{quote(username)}@" if username else ""
     return f"{auth}{ip}"
 
@@ -117,19 +118,18 @@ class Samba(Service, Fetchable):
     # The username behind the current shares/printers listing, so links built from
     # it (see resources()) can carry it too - None for an anonymous listing.
     username: str | None = None
-    # Set once by enrich_device, so _share_action/_printer_action can build their
-    # smb:// uri from Device.smb_host() (a wsdd/mDNS name, preferred over a bare ip
-    # - see that method) instead of always using self.ip. compare=False/repr=False:
-    # this is a live back-reference, not this service's own data - comparing it
-    # would recurse right back into this very Samba instance via Device.services,
-    # and dataclass __eq__/__repr__ have no cycle protection.
+    # Set once by enrich_device, so _share_action/_printer_action can build
+    # smb:// uris from Device.smb_host() instead of always using self.ip.
+    # compare=False/repr=False: a live back-reference, not this service's
+    # own data - comparing it would recurse back into this Samba instance
+    # via Device.services, and dataclass __eq__/__repr__ have no cycle
+    # protection.
     _device: "Device | None" = field(default=None, compare=False, repr=False)
 
     def __setattr__(self, name: str, value) -> None:
-        # Lets `shares`/`printers` be assigned as bare share names (a plain string
-        # has no comment to carry) as well as SmbShare - construction, fetch(), and
-        # any later reassignment (tests, callers) all go through this, so there's
-        # one coercion point instead of every call site remembering to wrap names.
+        # Lets `shares`/`printers` be assigned as bare share names (no
+        # comment to carry) as well as SmbShare - one coercion point instead
+        # of every call site remembering to wrap names.
         if name in ("shares", "printers") and value is not None:
             value = [v if isinstance(v, SmbShare) else SmbShare(v) for v in value]
         super().__setattr__(name, value)
@@ -181,32 +181,32 @@ class Samba(Service, Fetchable):
         self._device = device
 
     def _host(self) -> str:
-        """Device.smb_host()'s wsdd/mDNS-preferred name, when this service has
-        actually been attached to a device (see enrich_device) - a Samba built
-        directly, without going through Device.add_service (only ever done in
-        tests), falls back to its own bare ip instead."""
+        """Device.smb_host()'s wsdd/mDNS-preferred name, once attached to a
+        device (see enrich_device). A Samba built directly, without going
+        through Device.add_service (tests only), falls back to its own bare
+        ip."""
         return self._device.smb_host() if self._device else self.ip
 
     def _share_action(self, share: SmbShare) -> LaunchAction:
         return LaunchAction(label=share.name, uri=f"smb://{_smb_authority(self._host(), self.username)}/{share.name}")
 
     def _printer_action(self, printer: SmbShare) -> LaunchAction:
-        """A basic placeholder for an SMB-shared printer resource. Unlike a file
-        share, there's no single standard "open" action for a network printer -
-        most desktops resolve one through their own Add Printer/CUPS dialog, not a
-        uri a browser or file manager can act on directly. This reuses the same
-        smb:// address a file share would use, since some file managers can still
-        browse/resolve it; treat it as a starting point to build on, not a
-        finished "connect me" flow."""
+        """A basic placeholder for an SMB-shared printer resource.
+
+        Unlike a file share, there's no standard "open" action for a network
+        printer - most desktops resolve one via their own Add Printer/CUPS
+        dialog, not a uri. Reuses the same smb:// address a file share would
+        use, since some file managers can still browse it. A starting point,
+        not a finished "connect me" flow."""
         return LaunchAction(label=printer.name,
                              uri=f"smb://{_smb_authority(self._host(), self.username)}/{printer.name}")
 
     def resources(self) -> Iterator[Resource]:
-        # Nothing to yield until a fetch has actually landed - covers NOT_FETCHED,
-        # LOADING, and AUTH_REQUIRED alike (all leave shares as None); triggering
-        # that fetch, and surfacing a login prompt for AUTH_REQUIRED, are both the
-        # caller's job now (see NetworkScanner.ensure_fetched and ui/base.py's
-        # LoginPromptView), not this method's.
+        # Nothing to yield until a fetch has landed - covers NOT_FETCHED,
+        # LOADING and AUTH_REQUIRED alike (all leave shares as None).
+        # Triggering that fetch, and showing a login prompt for
+        # AUTH_REQUIRED, is the caller's job (see NetworkScanner.
+        # ensure_fetched and ui/base.py's LoginPromptView).
         if self.shares is None:
             return
         # Both share types come from the same fetch and render together - see
@@ -229,11 +229,11 @@ class Incus(Service, Fetchable):
     expandable: ClassVar[bool] = True
     instances: list[IncusInstance] | None = None
     accessible: bool = True  # False: fetched, but the server didn't trust our client
-    # incus/LXD's own error message for the failed request (e.g. "not authorized"
-    # for an untrusted TLS client cert) - None unless accessible is False. The
-    # Virtual Machines tab's status_text stays a brief "not accessible" (it has to
-    # fit alongside action buttons in a compact tab); this is the real detail,
-    # surfaced in Properties instead - see extra_properties.
+    # incus/LXD's own error message for the failed request (e.g. "not
+    # authorized" for an untrusted TLS client cert) - None unless accessible
+    # is False. The Virtual Machines tab's status_text stays a brief "not
+    # accessible"; this is the real detail, surfaced in Properties instead -
+    # see extra_properties.
     error: str | None = None
 
     @property
@@ -249,10 +249,10 @@ class Incus(Service, Fetchable):
 
     @property
     def fetch_state(self) -> FetchState:
-        # "not accessible" (accessible=False) is still a completed fetch, not an
-        # auth prompt - unlike Samba, Incus has no interactive retry-with-
-        # credentials flow, so an inaccessible server just shows as LOADED with an
-        # empty instance list and an explanatory error (see extra_properties).
+        # "not accessible" (accessible=False) is still a completed fetch, not
+        # an auth prompt - unlike Samba, Incus has no retry-with-credentials
+        # flow, so an inaccessible server just shows LOADED with an empty
+        # instance list and an explanatory error (see extra_properties).
         if self.loading:
             return FetchState.LOADING
         if self.instances is not None:
@@ -284,13 +284,12 @@ class Incus(Service, Fetchable):
         return LaunchAction(label=f"{instance.name} ({instance.status})", uri=f"https://{self.ip}:{self.port}/ui/")
 
     def resources(self) -> Iterator[Resource]:
-        # The general web-admin link is always yielded, not just once fetched:
-        # without it, a device with zero instances (or not yet fetched, or
-        # inaccessible) would leave the Virtual Machines tab with a status_text but
-        # nothing clickable at all - a dead end for a service that plainly has a
-        # working link available, same principle as the base Service class and ipp
-        # (see their resources()). Per-instance console links, once fetched,
-        # supplement this rather than replacing it.
+        # The general web-admin link is always yielded, not just once
+        # fetched: without it, a device with zero/unfetched/inaccessible
+        # instances would leave the tab with a status_text but nothing
+        # clickable (same principle as the base Service class and ipp - see
+        # their resources()). Per-instance console links supplement this,
+        # not replace it.
         yield Resource(ResourceCategory.VIRTUAL_MACHINES, web_admin_action(self, path="/ui/", scheme="https"))
         if self.instances is None:
             return
@@ -301,21 +300,20 @@ class Incus(Service, Fetchable):
 @register("ssh")
 @dataclass
 class Ssh(Service):
-    """ssh itself needs no fetch - the terminal launch is always available; expanding
-    the row reveals an sftp path/user form for jumping into a file manager instead
-    (immediate=False, below - not gated on any fetch, just not worth cluttering the
-    collapsed row with). Spans two categories, same idea as Samba spanning
-    FILE_SHARES + PRINTERS: one ssh service (and the credentials it holds) backs
-    two distinct resources - a terminal launch (TERMINAL) and an sftp file browser
-    (FILE_SHARES) - each belonging in its own tab, not both crammed under
-    "Terminal" just because one service produces them."""
+    """ssh needs no fetch - the terminal launch is always available. Expanding
+    the row reveals an sftp path/user form instead (immediate=False, below -
+    not gated on a fetch, just not worth cluttering the collapsed row with).
+
+    Spans two categories, like Samba spanning FILE_SHARES + PRINTERS: one ssh
+    service backs two distinct resources - a terminal launch (TERMINAL) and
+    an sftp file browser (FILE_SHARES) - each in its own tab rather than
+    both crammed under "Terminal"."""
     expandable: ClassVar[bool] = True
-    # Set once by enrich_device, so _host can build the sftp:// browse link from
-    # Device.ssh_host() (a known_hosts/etc-hosts/mDNS name, preferred over a bare
-    # ip - see that method) instead of always using self.ip. compare=False/
-    # repr=False for the same reason as Samba._device (see there): a live
-    # back-reference, not this service's own data, whose equality would otherwise
-    # recurse right back into this very Ssh instance via Device.services.
+    # Set once by enrich_device, so _host can build the sftp:// browse link
+    # from Device.ssh_host() instead of always using self.ip. compare=False/
+    # repr=False for the same reason as Samba._device: a live back-reference
+    # whose equality would recurse back into this Ssh instance via
+    # Device.services.
     _device: "Device | None" = field(default=None, compare=False, repr=False)
 
     def enrich_device(self, device: "Device") -> None:
@@ -323,10 +321,9 @@ class Ssh(Service):
         self._device = device
 
     def _host(self) -> str:
-        """Device.ssh_host() when this service has actually been attached to a
-        device (see enrich_device) - an Ssh built directly, without going through
-        Device.add_service (only ever done in tests), falls back to its own bare ip
-        instead."""
+        """Device.ssh_host(), once attached to a device (see enrich_device).
+        An Ssh built directly, without going through Device.add_service
+        (tests only), falls back to its own bare ip."""
         return self._device.ssh_host() if self._device else self.ip
 
     def resources(self) -> Iterator[Resource]:
@@ -359,16 +356,17 @@ class LpdPrinterService(SilentService):
 @register("ipp", "ipps")
 @dataclass
 class Ipp(Service):
-    """Modern IPP/IPPS printer sharing. Bonjour IPP advertisements often carry an
-    "adminurl" txt record pointing straight at the printer's web status page - trust
-    that when it's there, since it's more reliable than guessing a port; port 80 is
-    the fallback, since that's where most printers' embedded web servers live."""
+    """Modern IPP/IPPS printer sharing. Bonjour IPP advertisements often carry
+    an "adminurl" txt record pointing at the printer's web status page -
+    trusted when present, since it's more reliable than guessing a port.
+    Port 80 is the fallback, where most printers' embedded web servers
+    live."""
 
     def resources(self) -> Iterator[Resource]:
-        # ipp has exactly one resource and no deeper structure (unlike
-        # smb/incus/cups), so its Printers tab shows the same admin link Overview
-        # does (immediate, the default), rather than a dead, unclickable fallback
-        # label.
+        # ipp has exactly one resource, no deeper structure (unlike
+        # smb/incus/cups), so its Printers tab shows the same admin link
+        # Overview does (immediate, the default) rather than a dead,
+        # unclickable fallback label.
         admin_url = self.txt("adminurl")
         if admin_url:
             action = LaunchAction(label="Printer admin", uri=admin_url)
@@ -378,11 +376,11 @@ class Ipp(Service):
 
     def enrich_device(self, device: "Device") -> None:
         super().enrich_device(device)  # offers the mDNS instance name as an alias too
-        # "ty" (type) is the human-readable model/description Bonjour printer shares
-        # standardize (e.g. "HP LaserJet Pro M404dn"); "note" is whatever the admin
-        # set (often a location, e.g. "2nd Floor") - both are useful supplementary
-        # info, so they're offered as aliases rather than promoted over a name someone
-        # deliberately gave the device.
+        # "ty" (type) is the human-readable model/description Bonjour
+        # printer shares standardise (e.g. "HP LaserJet Pro M404dn"); "note"
+        # is whatever the admin set (often a location). Both offered as
+        # aliases rather than promoted over a name someone deliberately gave
+        # the device.
         for key in ("ty", "note"):
             value = self.txt(key)
             if value:
@@ -395,12 +393,13 @@ _CUPS_QUEUE_RE = re.compile(rb'href="/printers/([^"/]+)"', re.IGNORECASE)
 @register("cups")
 @dataclass
 class Cups(Service, Fetchable):
-    """A CUPS server can host several physical printer queues; each queue is a
-    resource, listed lazily (mirrors how Incus lists instances). CUPS has no clean
-    machine-readable "list queues" endpoint short of the binary IPP protocol, so this
-    scrapes queue names out of its HTML /printers/ page instead - best-effort (CUPS's
-    markup isn't a stable contract the way incus's JSON API is), but turns "a print
-    server" into "these specific queues," each one click away."""
+    """A CUPS server can host several physical printer queues; each queue is
+    a resource, listed lazily (mirrors how Incus lists instances).
+
+    CUPS has no clean machine-readable "list queues" endpoint short of the
+    binary IPP protocol, so this scrapes queue names out of its HTML
+    /printers/ page instead - best-effort, since CUPS's markup isn't a
+    stable contract the way incus's JSON API is."""
 
     expandable: ClassVar[bool] = True
     queues: list[str] | None = None
@@ -433,11 +432,9 @@ class Cups(Service, Fetchable):
         self.queues = sorted({m.decode(errors="replace") for m in _CUPS_QUEUE_RE.findall(body)})
 
     def resources(self) -> Iterator[Resource]:
-        # The general web-admin link is always yielded, not just once fetched -
-        # see Incus.resources() for why: without it, a server with zero queues (or
-        # not yet fetched) leaves the Printers tab with a status_text but nothing
-        # clickable at all. Per-queue links, once fetched, supplement this rather
-        # than replacing it.
+        # The general web-admin link is always yielded, not just once
+        # fetched - see Incus.resources() for why. Per-queue links, once
+        # fetched, supplement this rather than replace it.
         action = web_admin_action(self, path="/", scheme="http", label="Printer admin")
         yield Resource(ResourceCategory.PRINTERS, action)
         if self.queues is None:
@@ -450,17 +447,15 @@ class Cups(Service, Fetchable):
 @register("device-info")
 @dataclass
 class DeviceInfo(Service):
-    """Carries no actions of its own - _device-info._tcp exists purely to advertise
-    txt records about the device it's running on, so this is the metadata-enrichment
-    service: it exists to update its parent Device rather than to be interacted with."""
+    """Carries no actions of its own - _device-info._tcp exists purely to
+    advertise txt records about the device it's running on. Exists to update
+    its parent Device, not to be interacted with."""
 
     def enrich_device(self, device: "Device") -> None:
-        # "model" (e.g. "MacBookPro18,3") is deliberately never used as a name or
-        # alias here - it's hardware metadata, not something anyone would call the
-        # device by. It's still visible verbatim in the Properties tab's raw txt
-        # record dump, so nothing is lost by leaving it out of Names; a device with
-        # no discovered_name at all just falls back to showing its IP as hostname
-        # instead of a model code.
+        # "model" (e.g. "MacBookPro18,3") is never used as a name or alias -
+        # it's hardware metadata, not something anyone would call the device
+        # by. Still visible verbatim in the Properties tab's raw txt dump, so
+        # nothing is lost by leaving it out of Names.
         if self.discovered_name:
             device.promote_name(self.kind, self.discovered_name)
 

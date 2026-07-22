@@ -9,9 +9,11 @@ import pytest
 
 from netlook.core import discovery
 from netlook.core.discovery import (
+    ArpCacheDiscovery,
     WsdDiscovery,
     _fetch_wsd_friendly_name,
     _is_local,
+    _parse_arp_cache,
     _parse_etc_hosts,
     _parse_known_hosts,
     _pick_address,
@@ -62,6 +64,63 @@ def test_parse_etc_hosts_yields_nothing_for_a_missing_file(tmp_path):
     entries = list(_parse_etc_hosts(tmp_path / "does-not-exist"))
 
     assert entries == []
+
+
+def test_parse_arp_cache_skips_incomplete_and_public_entries(tmp_path):
+    """Verify that _parse_arp_cache keeps only complete (resolved), local entries
+    from a /proc/net/arp-style fixture, skipping the header row, incomplete entries
+    (flags 0x0 or an all-zero hardware address), and any public IP."""
+    arp_file = tmp_path / "arp"
+    arp_file.write_text(
+        "IP address       HW type     Flags       HW address            Mask     Device\n"
+        "192.168.1.253    0x1         0x2         9c:bf:0d:00:f2:db     *        eth0\n"
+        "192.168.1.144    0x1         0x0         00:00:00:00:00:00     *        eth0\n"
+        "8.8.8.8          0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0\n"
+    )
+
+    addresses = _parse_arp_cache(arp_file)
+
+    assert addresses == ["192.168.1.253"]
+
+
+def test_parse_arp_cache_returns_nothing_for_a_missing_file(tmp_path):
+    """Verify that _parse_arp_cache fails gracefully with no entries and no
+    exception when the file doesn't exist (e.g. on a non-Linux platform)."""
+    addresses = _parse_arp_cache(tmp_path / "does-not-exist")
+
+    assert addresses == []
+
+
+async def test_arp_cache_discovery_queues_each_address_with_its_reverse_hostname(tmp_path, monkeypatch):
+    """Verify that ArpCacheDiscovery.start() queues a probe for every address in its
+    /proc/net/arp-style file, tagged with its SOURCE, and attaches a reverse-resolved
+    hostname when one is available - falling back to no hostname when it isn't."""
+    arp_file = tmp_path / "arp"
+    arp_file.write_text(
+        "IP address       HW type     Flags       HW address            Mask     Device\n"
+        "192.168.1.253    0x1         0x2         9c:bf:0d:00:f2:db     *        eth0\n"
+        "192.168.1.1      0x1         0x2         ac:8b:a9:63:57:81     *        eth0\n"
+    )
+
+    def fake_gethostbyaddr(ip):
+        if ip == "192.168.1.253":
+            return ("alpaca", [], [ip])
+        raise OSError("no reverse entry")
+
+    monkeypatch.setattr(socket, "gethostbyaddr", fake_gethostbyaddr)
+    queued = []
+
+    class FakeCtx:
+        async def queue_probe(self, ip, hostname=None, source=""):
+            queued.append((ip, hostname, source))
+
+    engine = ArpCacheDiscovery(path=arp_file)
+    await engine.start(FakeCtx())
+
+    assert queued == [
+        ("192.168.1.253", "alpaca", "arp-cache"),
+        ("192.168.1.1", None, "arp-cache"),
+    ]
 
 
 async def test_parse_known_hosts_skips_hashed_lines_and_resolves_local_entries(tmp_path, monkeypatch):

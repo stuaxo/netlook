@@ -1,12 +1,12 @@
-"""Textual TUI frontend. Runs on the same asyncio event loop as the async core (no
-threading bridge needed here, unlike ui/dpg.py) - this module can just `await`
-scanner/action calls directly.
+"""Textual TUI frontend. Runs on the same asyncio event loop as the async
+core (no threading bridge needed, unlike ui/dpg.py) - this module can just
+`await` scanner/action calls directly.
 
-Layout mirrors ui/dpg.py exactly, both reading from the same ui/base.py View Model:
-a strictly horizontal collapsed row (arrow, hostname, (ip), then every immediate
-action button), and an expanded TabbedContent whose first pane is Names (identity -
-hostname, aliases, each with its provenance), labeled with the device's own current
-hostname, followed by one tab per ResourceCategory with a matching service, then
+Layout mirrors ui/dpg.py, both reading from the same ui/base.py View Model:
+a horizontal collapsed row (arrow, hostname, (ip), then every immediate
+action button), and an expanded TabbedContent whose first pane is Names
+(hostname, aliases, each with provenance) labeled with the device's current
+hostname, followed by one tab per matching ResourceCategory, then
 Properties.
 """
 from __future__ import annotations
@@ -46,12 +46,11 @@ def _static_with_tooltip(text: str, tooltip: str) -> Static:
 
 
 def _trim_button(button: Button) -> Button:
-    """Zeroes out line-pad (the blank column Button reserves on each side of its
-    label) so a compact/borderless button is genuinely single-height with no
-    residual padding - can't be done via the `.toggle`/`.tag`/`.utility` CSS
-    classes themselves (see NetworkBrowserApp.CSS), since this Textual version's
-    CSS integer parser rejects a literal `line-pad: 0;`, even though 0 is the
-    property's own default."""
+    """Zeroes line-pad (the blank column Button reserves on each side of its
+    label), so a compact/borderless button is genuinely single-height. Can't
+    be done via the `.toggle`/`.tag`/`.utility` CSS classes (see
+    NetworkBrowserApp.CSS): this Textual version's CSS parser rejects a
+    literal `line-pad: 0;`, even though 0 is the property's own default."""
     button.styles.line_pad = 0
     return button
 
@@ -149,19 +148,23 @@ class DeviceRow(Widget):
         return f"props-section-{section_id}"
 
     def _compose_properties_tab(self) -> ComposeResult:
-        """Raw mDNS TXT records, one Collapsible section per service, defaulting to
-        closed - this tab gets long, and Expand All/Collapse All (top right)
-        toggles every section on this device at once (see on_button_pressed).
-        Each section's open/closed state is tracked in self.state and reapplied
-        via Collapsible(collapsed=...) on every rebuild, since Textual rebuilds
-        every DeviceRow from scratch on each refresh; on_collapsible_expanded/
-        collapsed (below) is what records a manual toggle before that happens.
+        """Raw mDNS TXT records, one Collapsible section per service,
+        defaulting to closed - this tab gets long, and Expand All/Collapse
+        All (top right) toggles every section at once (see
+        on_button_pressed).
 
-        A service with nothing to show (no properties at all, or only
+        Each section's open/closed state is tracked in self.state and
+        reapplied via Collapsible(collapsed=...) on every rebuild, since
+        Textual rebuilds every DeviceRow from scratch on refresh;
+        on_collapsible_expanded/collapsed (below) records a manual toggle
+        before that happens.
+
+        A service with nothing to show (no properties, or only
         blank-decoded keys) is skipped entirely, header included. Physical
-        Devices only ever has anything to show for this machine's own row (see
-        Device.physical_interfaces), so it's skipped just as completely for
-        every other device."""
+        Devices only has anything to show for this machine's own row (see
+        Device.physical_interfaces), so it's skipped for every other
+        device. Finders always renders - Not Found is exactly as
+        informative as Found."""
         section_ids = properties_section_ids(self.view.properties)
         all_expanded = self.state.all_properties_expanded(self.view.ip, section_ids)
         with TabPane("Properties", id="tab-properties"):
@@ -177,6 +180,13 @@ class DeviceRow(Widget):
                     ))
                     toggle_button.is_toggle_all_properties = True
                     yield toggle_button
+                with Collapsible(
+                    title=Text("Finders"), id=self._properties_section_id("finders"),
+                    collapsed=not self.state.is_properties_section_expanded(self.view.ip, "finders"),
+                ):
+                    for finder in self.view.properties.finders:
+                        status = "Found" if finder.found else "Not Found"
+                        yield Static(f"  {finder.label} = {status}", markup=False)
                 if self.view.properties.physical_devices:
                     with Collapsible(
                         title=Text("Physical Devices"), id=self._properties_section_id("physical_devices"),
@@ -201,10 +211,11 @@ class DeviceRow(Widget):
         return _static_with_tooltip(self.view.hostname, f"Source: {sources}")
 
     def _compose_names_tab(self) -> ComposeResult:
-        """The expanded view's first tab: identity (icon - not yet rendered in the
-        TUI, hostname, aliases, each with its provenance), labeled with the
-        device's own current hostname. About *which device this is*, not what you
-        can do with it - actions live in the category tabs alongside this one."""
+        """The expanded view's first tab: identity (icon - not yet rendered
+        in the TUI - hostname, aliases, each with provenance), labeled with
+        the device's current hostname. About which device this is, not what
+        you can do with it - actions live in the category tabs alongside
+        this one."""
         with TabPane(self.view.hostname, id="tab-names"):
             yield self._hostname_static()
             for name, sources in sorted(self.view.names.aliases.items()):
@@ -241,21 +252,19 @@ class DeviceRow(Widget):
                     yield from self._compose_properties_tab()
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
-        """Tracks whichever tab the user just switched to, so a later unrelated
-        refresh (which fully rebuilds this row - there's no widget to just leave
-        alone) lands back on that tab instead of silently resetting to Names. Also
-        fires (harmlessly redundantly) from compose()'s own `initial=`, since
-        that's a real tab activation too."""
+        """Tracks whichever tab the user just switched to, so a later
+        unrelated refresh (which fully rebuilds this row) lands back on it
+        instead of resetting to Names. Also fires, harmlessly, from
+        compose()'s own `initial=`."""
         tab_id = event.tabbed_content.active.removeprefix("tab-")
         self.state.set_active_tab(self.view.ip, tab_id)
 
     def _scroll_into_view(self) -> None:
-        """refresh_now() rebuilds every DeviceRow from scratch, so `self` is about
-        to be torn down - looks up its replacement by ip and scrolls it into view
-        immediately after, so expanding/collapsing keeps the row the user just
-        clicked on-screen instead of leaving them to relocate it after everything
-        below it shifts down (the inline-accordion behavior this app is going
-        for, rather than a detail pane that yanks focus away from the list)."""
+        """refresh_now() rebuilds every DeviceRow from scratch, so `self` is
+        about to be torn down - looks up its replacement by ip and scrolls
+        it into view after, so expanding/collapsing keeps the clicked row
+        on-screen instead of leaving the user to relocate it once rows
+        below shift down."""
         ip = self.view.ip
         for row in self.app.query(DeviceRow):
             if row.view.ip == ip:
@@ -274,10 +283,10 @@ class DeviceRow(Widget):
             await self.app.refresh_now()
             self._scroll_into_view()
         elif getattr(button, "is_toggle_all_properties", False):
-            # Applies immediately to whatever's currently mounted (no rebuild
-            # needed - unlike is_toggle/is_view_category above, nothing about
-            # which resources exist changed) and updates self.state so a later
-            # unrelated refresh_now() remembers it, the same idea as
+            # Applies immediately to whatever's mounted (no rebuild needed -
+            # unlike is_toggle/is_view_category above, nothing about which
+            # resources exist changed) and updates self.state so a later
+            # refresh_now() remembers it, same idea as
             # on_collapsible_expanded/collapsed below.
             section_ids = properties_section_ids(self.view.properties)
             expand = not self.state.all_properties_expanded(self.view.ip, section_ids)
@@ -300,11 +309,11 @@ class DeviceRow(Widget):
             await button.run_action.run(self.scanner)
 
     def on_collapsible_expanded(self, event: Collapsible.Expanded) -> None:
-        """collapsing_header in DPG has no toggle callback at all; Textual's
-        Collapsible does, just not named `Toggled` (that's an unused base class -
-        the real messages are Expanded/Collapsed). Records a manual toggle before
-        a later unrelated refresh_now() rebuilds this row from scratch and would
-        otherwise silently reset it to collapsed."""
+        """DPG's collapsing_header has no toggle callback; Textual's
+        Collapsible does, just not named `Toggled` (that's an unused base
+        class - the real messages are Expanded/Collapsed). Records a
+        manual toggle before a later refresh_now() rebuilds this row and
+        would otherwise reset it to collapsed."""
         event.stop()
         section_id = (event.collapsible.id or "").removeprefix("props-section-")
         self.state.set_properties_section_expanded(self.view.ip, section_id, True)
@@ -321,17 +330,14 @@ class NetworkBrowserApp(App):
 
     CSS = """
     DeviceRow { height: auto; margin-bottom: 1; }
-    /* Vertical defaults to `height: 1fr` (fill whatever space its parent has
-       left) - fine for a one-shot screen layout, but wrong anywhere inside a
-       DeviceRow: both its own expanded-state wrapper (compose()) and each
-       category-tab entry's wrapper (_compose_category_tab) used to balloon to
-       fill all the way up to the nearest height cap regardless of actual
-       content, shoving rows below off-screen and reading as a fixed pane
-       rather than an inline accordion. A descendant selector, not just
-       `DeviceRow > Vertical`, since the entry wrapper is nested several levels
-       deeper (inside TabbedContent/ContentSwitcher/TabPane/VerticalScroll),
-       not a direct child - auto sizes every one of them to real content
-       instead, so later rows/entries just shift down underneath. */
+    /* Vertical defaults to `height: 1fr` (fill remaining parent space) -
+       wrong inside a DeviceRow: both its expanded-state wrapper (compose())
+       and each category-tab entry's wrapper (_compose_category_tab) used to
+       balloon to the nearest height cap regardless of content, pushing rows
+       below off-screen. A descendant selector, not `DeviceRow > Vertical`,
+       since the entry wrapper is nested several levels deeper (inside
+       TabbedContent/ContentSwitcher/TabPane/VerticalScroll). Auto sizes
+       each to real content, so later rows shift down underneath instead. */
     DeviceRow Vertical { height: auto; }
     TabbedContent { height: auto; max-height: 20; }
     Horizontal { height: auto; }
@@ -340,18 +346,15 @@ class NetworkBrowserApp(App):
        labels sitting alongside buttons in a horizontal row. */
     Static { width: auto; }
 
-    /* VerticalScroll (used for every tab body - see _compose_category_tab and
-       _compose_properties_tab) defaults to `height: 1fr`, same problem as plain
-       Vertical above but one level deeper: TabPane/ContentSwitcher are
-       height:auto, and an auto-sized ancestor with a 1fr descendant gets
-       stretched to fill all the way up to TabbedContent's own max-height cap -
-       so even a device with two lines of content rendered as a ~20-row-tall
-       box, eating the rest of the screen regardless of how little it actually
-       had to show. .tab-body sizes to its real content instead, and only caps
-       out (falling back to its own scrollbar) for a device that genuinely has
-       more than max-height worth to show. Scoped to this class, not a blanket
-       VerticalScroll rule, since #device-list (the outer, whole-app scroll
-       region) still needs height:1fr to fill and scroll the real screen. */
+    /* VerticalScroll (every tab body - see _compose_category_tab and
+       _compose_properties_tab) defaults to `height: 1fr`, same problem as
+       Vertical above but one level deeper: an auto-sized TabPane/
+       ContentSwitcher with a 1fr descendant stretches to TabbedContent's
+       max-height cap, so even two lines of content render as a ~20-row box.
+       .tab-body sizes to real content instead, falling back to its own
+       scrollbar only once content exceeds max-height. Scoped to this class,
+       not a blanket VerticalScroll rule, since #device-list (the outer
+       whole-app scroll region) still needs height:1fr. */
     .tab-body { height: auto; max-height: 14; }
 
     /* The collapsed/expanded disclosure arrow: a bare glyph with no border,
@@ -432,11 +435,11 @@ class NetworkBrowserApp(App):
             await self.save_devices()
 
     async def save_devices(self) -> None:
-        """Writes every currently-known device's data to a JSON file, using each
-        device's current expand-state (view_state.is_expanded) - the same
-        lazy-load-respecting snapshot already on screen, not a forced full-expand
-        of every device, which would trigger the eager, unprompted fetches lazy
-        loading exists to prevent."""
+        """Writes every currently-known device's data to a JSON file, using
+        each device's current expand-state (view_state.is_expanded) - the
+        same lazy-load-respecting snapshot already on screen, not a forced
+        full-expand that would trigger the eager fetches lazy loading exists
+        to prevent."""
         views = [
             await build_device_row_view(dev, self.scanner, expanded=self.view_state.is_expanded(dev.ip))
             for dev in list(self.scanner.devices.values())

@@ -325,7 +325,8 @@ async def test_properties_sections_default_to_collapsed():
         await pilot.pause()
 
         properties_pane = app.query_one(TabbedContent).get_pane("tab-properties")
-        assert [c.collapsed for c in properties_pane.query(Collapsible)] == [True]
+        # "Finders" (always shown) + "smb" - both start collapsed.
+        assert [c.collapsed for c in properties_pane.query(Collapsible)] == [True, True]
 
 
 async def test_expand_all_button_expands_every_section_and_flips_its_own_label():
@@ -360,7 +361,8 @@ async def test_expand_all_button_expands_every_section_and_flips_its_own_label()
 
         assert str(toggle_button.label) == "Collapse All"
         properties_pane = app.query_one(TabbedContent).get_pane("tab-properties")
-        assert [c.collapsed for c in properties_pane.query(Collapsible)] == [False]
+        # "Finders" (always shown) + "smb" - both now expanded.
+        assert [c.collapsed for c in properties_pane.query(Collapsible)] == [False, False]
 
 
 async def test_manually_toggling_a_properties_section_survives_an_unrelated_refresh():

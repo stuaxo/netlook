@@ -6,6 +6,7 @@ from netlook.core.services import Cups, Incus, Ipp, LpdPrinterService, PdlStream
 from netlook.ui.base import (
     NAMES_TAB_ID,
     PROPERTIES_TAB_ID,
+    FinderEntry,
     LoginPromptView,
     PropertiesTabView,
     PropertyEntry,
@@ -352,6 +353,25 @@ async def test_properties_carries_physical_interfaces_through_from_the_device():
     assert view.properties.physical_devices == [("wlan0", "aa:bb:cc:dd:ee:ff")]
 
 
+async def test_properties_finders_reflects_which_engines_reported_the_device():
+    """Verify that the Properties view's finders list covers every entry in
+    FINDER_SOURCES, in order, with found=True only for the sources actually
+    recorded in Device.found_by - so a device found via mDNS and the ARP cache
+    shows those two as Found and every other finder as Not Found."""
+    device = DeviceFactory()
+    device.found_by = {"mdns", "arp-cache"}
+
+    view = await build_device_row_view(device, scanner=None)
+
+    assert [(f.label, f.found) for f in view.properties.finders] == [
+        ("mDNS", True),
+        ("SSH known_hosts", False),
+        ("/etc/hosts", False),
+        ("WSD", False),
+        ("ARP cache", True),
+    ]
+
+
 async def test_properties_physical_devices_is_empty_without_any():
     """Verify that the Properties view's physical_devices is empty for an ordinary
     device (Device.physical_interfaces defaults to []) - the case for every device
@@ -502,11 +522,11 @@ async def test_save_devices_to_json_writes_saved_at_and_one_entry_per_view(tmp_p
 
 
 def test_properties_section_ids_matches_what_a_renderer_would_actually_show():
-    """Verify that properties_section_ids includes "physical_devices" (only when
-    non-empty) then each service with at least one non-blank-keyed property, in
-    order - skipping a service whose only properties are blank-keyed (matching a
-    renderer's own skip condition exactly), so Expand All/Collapse All never
-    targets a section that was never drawn."""
+    """Verify that properties_section_ids includes "finders" (always), then
+    "physical_devices" (only when non-empty), then each service with at least one
+    non-blank-keyed property, in order - skipping a service whose only properties
+    are blank-keyed (matching a renderer's own skip condition exactly), so Expand
+    All/Collapse All never targets a section that was never drawn."""
     properties = PropertiesTabView(
         ip="10.0.0.5", ipv6=None,
         services=[
@@ -515,21 +535,24 @@ def test_properties_section_ids_matches_what_a_renderer_would_actually_show():
             PropertyEntry(kind="empty", port=2, properties=[]),
         ],
         physical_devices=[("wlan0", "aa:bb:cc:dd:ee:ff")],
+        finders=[FinderEntry("mDNS", True)],
     )
 
-    assert properties_section_ids(properties) == ["physical_devices", "smb"]
+    assert properties_section_ids(properties) == ["finders", "physical_devices", "smb"]
 
 
 def test_properties_section_ids_omits_physical_devices_when_empty():
     """Verify that properties_section_ids leaves out "physical_devices" entirely
-    when there are none, matching a renderer never drawing that section either."""
+    when there are none, matching a renderer never drawing that section either -
+    "finders" still renders regardless."""
     properties = PropertiesTabView(
         ip="10.0.0.5", ipv6=None,
         services=[PropertyEntry(kind="smb", port=445, properties=[("vers", "3.0")])],
         physical_devices=[],
+        finders=[FinderEntry("mDNS", False)],
     )
 
-    assert properties_section_ids(properties) == ["smb"]
+    assert properties_section_ids(properties) == ["finders", "smb"]
 
 
 def test_view_model_state_properties_section_expansion_defaults_to_collapsed():

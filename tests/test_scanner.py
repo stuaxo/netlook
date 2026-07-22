@@ -78,6 +78,16 @@ async def test_queue_probe_canonicalizes_a_local_machine_ip(net_scanner):
     assert net_scanner.devices["192.168.99.1"].hostname == "some-loopback-name"
 
 
+async def test_queue_probe_records_its_source_in_found_by(net_scanner):
+    """Verify that queue_probe adds its `source` to the device's found_by set,
+    independent of naming - the Properties tab's "Finders" section reads this,
+    not `names`, so it still marks the device Found even when no hostname was
+    given (see test_queue_probe_falls_back_to_the_bare_ip_when_no_hostname_is_given)."""
+    await net_scanner.queue_probe("192.168.1.77", None, source="arp-cache")
+
+    assert net_scanner.devices["192.168.1.77"].found_by == {"arp-cache"}
+
+
 async def test_start_seeds_the_local_machine_device_with_localhost_as_a_name(net_scanner):
     """Verify that start() pre-seeds the canonical local-machine device with
     "localhost" as its hostname and one of its names, so this machine shows up in
@@ -225,6 +235,7 @@ async def test_discover_mdns_service_builds_a_device_from_a_service_announcement
     device = net_scanner.devices["10.0.0.9"]
     assert device.hostname == "MyNAS"
     assert "smb" in device.services
+    assert device.found_by == {"mdns"}
 
 
 async def test_discover_mdns_service_ignores_an_announcement_with_no_resolvable_address(net_scanner, fake_zeroconf):

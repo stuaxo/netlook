@@ -54,12 +54,11 @@ PROTOCOL_NAMES = {
     "ssh": "Secure Shell (SSH)",
     "rdp": "Remote Desktop (RDP)",
     "vnc": "Screen Sharing (VNC)",
-    # These four are raw protocol acronyms most users won't recognize on sight -
-    # named after what they actually are, not just the technical protocol, the
-    # same idea as the Printers tab's "Printer admin" wording (see
-    # web_admin_action call sites in services.py, which already override
-    # cups/ipp/ipps's action label separately - renaming these here only changes
-    # the category tab's entry header, not any button text).
+    # These four are raw protocol acronyms most users won't recognise -
+    # named after what they actually are, like the Printers tab's "Printer
+    # admin" wording (see web_admin_action call sites in services.py, which
+    # override cups/ipp/ipps's action label separately - renaming these here
+    # only changes the category tab's header, not any button text).
     "smb": "Windows file share (SMB)",
     "cups": "Print server (CUPS)",
     "ipp": "Network printer (IPP)",
@@ -90,10 +89,10 @@ class Action:
     fields: tuple[str, ...] = ()  # names of text inputs the UI must collect before run()
 
     async def run(self, scanner: "NetworkScanner", **kwargs) -> None:
-        """`scanner` is an explicit context reference, not a global - every
-        concrete Action here just launches an external app (a plain synchronous
-        call even though this method is async), so none of them actually need it
-        today; kept on the signature since a future input-driven Action might."""
+        """`scanner` is an explicit context reference, not a global. No
+        concrete Action here needs it today - each just launches an external
+        app - but it's kept on the signature for a future input-driven
+        Action that might."""
         raise NotImplementedError
 
     @staticmethod
@@ -105,12 +104,13 @@ class Action:
             print(f"Can't run {cmd[0]}: not found")
 
     def _open_directory(self, uri: str) -> None:
-        """Opens a GVfs directory uri (smb://, sftp://) via xdg-open, working around
-        gio open's inability to open one that GVfs hasn't already mounted (see
-        _uses_gio_open) by launching the default file manager directly instead - it
-        mounts on demand when given the uri directly, unlike gio open. Shared by
-        every Action that opens this kind of uri (LaunchAction's smb:// shares,
-        SftpBrowseAction) rather than each re-implementing the same workaround."""
+        """Opens a GVfs directory uri (smb://, sftp://) via xdg-open.
+
+        Works around gio open's inability to open a uri GVfs hasn't already
+        mounted (see _uses_gio_open) by launching the default file manager
+        directly instead - it mounts on demand, unlike gio open. Shared by
+        every Action that opens this kind of uri (LaunchAction's smb://
+        shares, SftpBrowseAction)."""
         if _uses_gio_open():
             file_manager = _default_file_manager()
             if file_manager:
@@ -121,14 +121,13 @@ class Action:
 
 @dataclass
 class LaunchAction(Action):
-    """Opens a uri via the system's default handler (xdg-open), or via remmina
-    (if installed) for a remote-session launch. Replaces what used to be five
-    near-identical Action subclasses (RemoteSessionAction, WebAdminAction,
-    ShareAction, SmbPrinterAction, IncusConsoleAction) that differed only in
-    how their uri got built, never in how they ran - that construction now
-    lives with whichever Service subclass owns the relevant knowledge
-    (services.py), or, for the couple of builders shared across several
-    unrelated kinds, as free functions in models.py."""
+    """Opens a uri via the system's default handler (xdg-open), or via
+    remmina (if installed) for a remote-session launch.
+
+    Replaces five near-identical Action subclasses that differed only in how
+    their uri got built, never how they ran - that construction now lives
+    with whichever Service subclass owns the relevant knowledge
+    (services.py), or as shared free functions in models.py."""
     uri: str = ""
     opener: str = "xdg-open"  # "remmina" for remote-session launches (ssh/rdp/vnc)
 

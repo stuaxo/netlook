@@ -31,3 +31,8 @@ Run:
 $ uv run netlook
 ```
 
+Test:
+
+```sh
+$ uv run pytest
+```
