@@ -685,14 +685,20 @@ def _add_properties_tab(dev_view: DeviceRowView):
     Finders always renders - Not Found is exactly as informative as
     Found."""
     section_ids = properties_section_ids(dev_view.properties)
+    shown_services = []
+    for entry in dev_view.properties.services:
+        properties = [(key, value) for key, value in entry.properties if key.strip()]
+        if properties:
+            shown_services.append((entry, properties))
     with dpg.tab(label="Properties", tag=_tab_tag(dev_view.ip, PROPERTIES_TAB_ID)):
+        dpg.add_text("IPs")
         with dpg.table(header_row=False, borders_innerH=False, borders_innerV=False,
                         borders_outerH=False, borders_outerV=False):
             dpg.add_table_column()
             dpg.add_table_column(width_fixed=True)  # auto-sized to the button's own label
             with dpg.table_row():
                 with dpg.group(horizontal=True):
-                    dpg.add_text("IP:")
+                    dpg.add_text("IPv4:")
                     _add_selectable_value(dev_view.properties.ip, width=_IPV4_VALUE_WIDTH)
                     if dev_view.properties.ipv6:
                         dpg.add_text("IPv6:")
@@ -704,9 +710,10 @@ def _add_properties_tab(dev_view: DeviceRowView):
                     user_data=(dev_view.ip, section_ids, not all_expanded),
                 )
 
-        shown = 0
         dpg.add_spacer(height=8)
-        shown += 1
+        dpg.add_separator()
+        dpg.add_spacer(height=8)
+        dpg.add_text("Data Sources")
         with dpg.collapsing_header(
             label="Finders", tag=_properties_section_tag(dev_view.ip, "finders"),
             default_open=_view_state.is_properties_section_expanded(dev_view.ip, "finders"),
@@ -718,25 +725,25 @@ def _add_properties_tab(dev_view: DeviceRowView):
 
         if dev_view.properties.physical_devices:
             dpg.add_spacer(height=8)
-            shown += 1
             with dpg.collapsing_header(
                 label="Physical Devices", tag=_properties_section_tag(dev_view.ip, "physical_devices"),
                 default_open=_view_state.is_properties_section_expanded(dev_view.ip, "physical_devices"),
             ):
                 _add_key_value_grid(dev_view.properties.physical_devices)
 
-        for entry in dev_view.properties.services:
-            properties = [(key, value) for key, value in entry.properties if key.strip()]
-            if not properties:
-                continue
-            if shown > 0:
-                dpg.add_spacer(height=8)
-            shown += 1
-            with dpg.collapsing_header(
-                label=f"{entry.kind} (port {entry.port})", tag=_properties_section_tag(dev_view.ip, entry.kind),
-                default_open=_view_state.is_properties_section_expanded(dev_view.ip, entry.kind),
-            ):
-                _add_key_value_grid(properties)
+        if shown_services:
+            dpg.add_spacer(height=8)
+            dpg.add_separator()
+            dpg.add_spacer(height=8)
+            dpg.add_text("mDNS")
+            for i, (entry, properties) in enumerate(shown_services):
+                if i > 0:
+                    dpg.add_spacer(height=8)
+                with dpg.collapsing_header(
+                    label=f"{entry.kind} (port {entry.port})", tag=_properties_section_tag(dev_view.ip, entry.kind),
+                    default_open=_view_state.is_properties_section_expanded(dev_view.ip, entry.kind),
+                ):
+                    _add_key_value_grid(properties)
 
 
 def _add_identity_line(dev_view: DeviceRowView) -> None:

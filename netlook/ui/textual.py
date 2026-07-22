@@ -15,7 +15,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widget import Widget
-from textual.widgets import Button, Collapsible, Input, Static, TabbedContent, TabPane
+from textual.widgets import Button, Collapsible, Input, Rule, Static, TabbedContent, TabPane
 
 from ..core.actions import display_name as _display_name
 from ..core.scanner import NetworkScanner
@@ -167,10 +167,16 @@ class DeviceRow(Widget):
         informative as Found."""
         section_ids = properties_section_ids(self.view.properties)
         all_expanded = self.state.all_properties_expanded(self.view.ip, section_ids)
+        shown_services = []
+        for entry in self.view.properties.services:
+            properties = [(key, value) for key, value in entry.properties if key.strip()]
+            if properties:
+                shown_services.append((entry, properties))
         with TabPane("Properties", id="tab-properties"):
             with VerticalScroll(classes="tab-body"):
+                yield Static(Text("IPs"), classes="section-heading")
                 with Horizontal():
-                    address = f"IP: {self.view.properties.ip}"
+                    address = f"IPv4: {self.view.properties.ip}"
                     if self.view.properties.ipv6:
                         address += f"  /  {self.view.properties.ipv6}"
                     yield Static(address, markup=False)
@@ -180,6 +186,8 @@ class DeviceRow(Widget):
                     ))
                     toggle_button.is_toggle_all_properties = True
                     yield toggle_button
+                yield Rule()
+                yield Static(Text("Data Sources"), classes="section-heading")
                 with Collapsible(
                     title=Text("Finders"), id=self._properties_section_id("finders"),
                     collapsed=not self.state.is_properties_section_expanded(self.view.ip, "finders"),
@@ -194,17 +202,17 @@ class DeviceRow(Widget):
                     ):
                         for name, mac in self.view.properties.physical_devices:
                             yield Static(f"  {name} = {mac}", markup=False)
-                for entry in self.view.properties.services:
-                    properties = [(key, value) for key, value in entry.properties if key.strip()]
-                    if not properties:
-                        continue
-                    with Collapsible(
-                        title=Text(f"{entry.kind} (port {entry.port})"),
-                        id=self._properties_section_id(entry.kind),
-                        collapsed=not self.state.is_properties_section_expanded(self.view.ip, entry.kind),
-                    ):
-                        for key, value in properties:
-                            yield Static(f"  {key} = {value}", markup=False)
+                if shown_services:
+                    yield Rule()
+                    yield Static(Text("mDNS"), classes="section-heading")
+                    for entry, properties in shown_services:
+                        with Collapsible(
+                            title=Text(f"{entry.kind} (port {entry.port})"),
+                            id=self._properties_section_id(entry.kind),
+                            collapsed=not self.state.is_properties_section_expanded(self.view.ip, entry.kind),
+                        ):
+                            for key, value in properties:
+                                yield Static(f"  {key} = {value}", markup=False)
 
     def _hostname_static(self) -> Static:
         sources = ", ".join(sorted(self.view.hostname_sources)) or "unknown"
@@ -392,6 +400,14 @@ class NetworkBrowserApp(App):
         border: none; padding: 0 1; background: $panel; color: $text-muted;
     }
     .utility:hover { background: $boost; color: $text; }
+
+    /* Properties tab group headings (IPs / Data Sources / mDNS) - just a
+       muted, bold label, no border/background, so it reads as a divider
+       between groups of Collapsibles without competing with them. */
+    .section-heading {
+        color: $text-muted; text-style: bold;
+        margin-top: 1;
+    }
     """
 
     def __init__(self, scanner: NetworkScanner | None = None):
