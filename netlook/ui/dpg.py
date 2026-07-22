@@ -682,7 +682,7 @@ def _add_properties_tab(dev_view: DeviceRowView):
     keys) is skipped entirely, header included. Physical Devices only has
     anything to show for this machine's own row (see
     Device.physical_interfaces), so it's skipped for every other device.
-    Finders always renders - Not Found is exactly as informative as
+    Finders and DNS always render - Not Found is exactly as informative as
     Found."""
     section_ids = properties_section_ids(dev_view.properties)
     shown_services = []
@@ -722,6 +722,13 @@ def _add_properties_tab(dev_view: DeviceRowView):
                 (finder.label, "Found" if finder.found else "Not Found")
                 for finder in dev_view.properties.finders
             ])
+
+        dpg.add_spacer(height=8)
+        with dpg.collapsing_header(
+            label="DNS", tag=_properties_section_tag(dev_view.ip, "dns"),
+            default_open=_view_state.is_properties_section_expanded(dev_view.ip, "dns"),
+        ):
+            _add_key_value_grid([("Reverse DNS", dev_view.properties.dns_hostname or "Not found")])
 
         if dev_view.properties.physical_devices:
             dpg.add_spacer(height=8)

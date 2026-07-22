@@ -1,10 +1,11 @@
 """Unit tests for netlook.core.scanner."""
 import json
+import socket
 
 import pytest
 
-from netlook.core import scanner
-from netlook.core.models import FetchState
+from netlook.core import discovery, scanner
+from netlook.core.models import Device, FetchState
 from netlook.core.scanner import _parse_ports, _split_addresses
 
 from doubles import FakeFetchable, FetchRecordingService
@@ -333,6 +334,44 @@ async def test_ensure_fetched_is_a_noop_for_a_service_that_isnt_fetchable(net_sc
     await net_scanner.ensure_fetched(service)
 
     assert service.fetch_calls == []
+
+
+async def test_ensure_dns_resolved_triggers_a_reverse_lookup_for_an_unresolved_device(net_scanner, monkeypatch):
+    """Verify that ensure_dns_resolved triggers a real reverse-DNS lookup (via
+    _resolve_dns) for a device whose dns_resolved is still False, populating
+    dns_hostname and marking the scanner dirty once it lands. Restores the real
+    _resolve_reverse_hostname (conftest's autouse _no_real_dns_lookups stubs it
+    out by default for every other test) since this one wants the genuine
+    end-to-end chain down to socket.gethostbyaddr."""
+    monkeypatch.setattr(scanner, "_resolve_reverse_hostname", discovery._resolve_reverse_hostname)
+    monkeypatch.setattr(socket, "gethostbyaddr", lambda ip: ("alpaca", [], [ip]))
+    device = Device(hostname="192.168.1.253", ip="192.168.1.253")
+
+    await net_scanner.ensure_dns_resolved(device)
+    await net_scanner.wait_idle()
+
+    assert device.dns_hostname == "alpaca"
+    assert net_scanner.dirty is True
+
+
+async def test_ensure_dns_resolved_is_a_noop_once_a_lookup_has_already_been_attempted(net_scanner, monkeypatch):
+    """Verify that ensure_dns_resolved does nothing for a device whose
+    dns_resolved is already True - a second row-expand shouldn't repeat the
+    lookup, same as ensure_fetched not repeating a fetch."""
+    calls = []
+
+    async def fake_resolve(ip):
+        calls.append(ip)
+        return "alpaca"
+
+    monkeypatch.setattr(scanner, "_resolve_reverse_hostname", fake_resolve)
+    device = Device(hostname="192.168.1.253", ip="192.168.1.253", dns_resolved=True)
+
+    await net_scanner.ensure_dns_resolved(device)
+    await net_scanner.wait_idle()
+
+    assert calls == []
+    assert device.dns_hostname is None
 
 
 @pytest.mark.parametrize("banner, expected", [

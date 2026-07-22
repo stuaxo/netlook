@@ -163,7 +163,7 @@ class DeviceRow(Widget):
         blank-decoded keys) is skipped entirely, header included. Physical
         Devices only has anything to show for this machine's own row (see
         Device.physical_interfaces), so it's skipped for every other
-        device. Finders always renders - Not Found is exactly as
+        device. Finders and DNS always render - Not Found is exactly as
         informative as Found."""
         section_ids = properties_section_ids(self.view.properties)
         all_expanded = self.state.all_properties_expanded(self.view.ip, section_ids)
@@ -195,6 +195,11 @@ class DeviceRow(Widget):
                     for finder in self.view.properties.finders:
                         status = "Found" if finder.found else "Not Found"
                         yield Static(f"  {finder.label} = {status}", markup=False)
+                with Collapsible(
+                    title=Text("DNS"), id=self._properties_section_id("dns"),
+                    collapsed=not self.state.is_properties_section_expanded(self.view.ip, "dns"),
+                ):
+                    yield Static(f"  Reverse DNS = {self.view.properties.dns_hostname or 'Not found'}", markup=False)
                 if self.view.properties.physical_devices:
                     with Collapsible(
                         title=Text("Physical Devices"), id=self._properties_section_id("physical_devices"),

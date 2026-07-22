@@ -9,6 +9,7 @@ import subprocess
 import httpx
 import pytest
 
+from netlook.core import discovery, scanner as scanner_module
 from netlook.core.models import SERVICE_REGISTRY
 from netlook.core.scanner import NetworkScanner
 
@@ -22,6 +23,42 @@ def service_registry():
     yield SERVICE_REGISTRY
     SERVICE_REGISTRY.clear()
     SERVICE_REGISTRY.update(original)
+
+
+@pytest.fixture(autouse=True)
+def _reverse_hostname_cache():
+    """Clears discovery._resolve_reverse_hostname's process-global cache before
+    every test, so one test's monkeypatched socket.gethostbyaddr result (or real
+    one, for a test that hits the real resolver) never leaks into another test
+    asking about the same IP."""
+    discovery._reverse_hostname_cache.clear()
+    yield
+    discovery._reverse_hostname_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_dns_lookups(monkeypatch):
+    """Stubs out NetworkScanner's reverse-DNS lookup (the name scanner.py imported
+    from discovery.py) with a plain, instant coroutine returning None, so a
+    full-app UI test that expands a device row (see ensure_dns_resolved) against a
+    real NetworkScanner never makes a real DNS round trip.
+
+    Patched here rather than at socket.gethostbyaddr: _resolve_reverse_hostname
+    calls that through asyncio.to_thread, which - even mocked - still hands the
+    call to a real OS thread pool, adding genuine scheduling nondeterminism, e.g.
+    NetworkBrowserApp's 0.5s poll_refresh interval firing mid-test, rebuilding
+    every DeviceRow (and invalidating a widget reference a test just queried) at
+    an unpredictable point. Patching this boundary instead keeps the whole path
+    on the event loop, as deterministic as every other mocked async collaborator
+    in this suite (see fake_http_connection). A test that wants the real
+    resolution chain overrides this itself, e.g.
+    monkeypatch.setattr(scanner_module, "_resolve_reverse_hostname",
+    discovery._resolve_reverse_hostname), which simply takes effect after this
+    one."""
+    async def no_ptr_record(ip):
+        return None
+
+    monkeypatch.setattr(scanner_module, "_resolve_reverse_hostname", no_ptr_record)
 
 
 @pytest.fixture

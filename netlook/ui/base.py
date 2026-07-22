@@ -116,17 +116,21 @@ class PropertiesTabView:
     # unlike physical_devices/services below, this section never disappears, since
     # "not found by this engine" is exactly as informative as "found by it".
     finders: list[FinderEntry]
+    # Reverse-DNS (PTR) name for `ip`, or None if none was found (or the lookup
+    # hasn't been triggered yet - see build_device_row_view). Always present,
+    # like finders: "no PTR record" is exactly as informative as one.
+    dns_hostname: str | None
 
 
 def properties_section_ids(properties: PropertiesTabView) -> list[str]:
     """The ordered list of section identifiers a Properties tab renders as a
-    collapsible block: "finders" (always), then "physical_devices" (if
+    collapsible block: "finders" and "dns" (always), then "physical_devices" (if
     non-empty), then each service with at least one non-blank-keyed
     property - matching the skip condition a renderer applies when deciding
     whether to draw a section (see _add_properties_tab/
     _compose_properties_tab), so "expand all"/"collapse all" never touches a
     section that was never shown."""
-    ids = ["finders"]
+    ids = ["finders", "dns"]
     if properties.physical_devices:
         ids.append("physical_devices")
     ids.extend(entry.kind for entry in properties.services if any(key.strip() for key, _ in entry.properties))
@@ -260,6 +264,12 @@ async def build_device_row_view(dev: Device, scanner: NetworkScanner, expanded: 
 
     category_tabs: list[CategoryTabView] = []
     if expanded:
+        # Triggering the reverse-DNS lookup only once a row actually expands
+        # mirrors ensure_fetched below - a live PTR lookup for every device on
+        # every refresh, whether anyone's looking or not, is the same
+        # unprompted-network-call problem lazy loading exists to prevent.
+        await scanner.ensure_dns_resolved(dev)
+
         # Each service's resources are computed once here, not once per
         # category it spans - a multi-category service (ssh) is only asked
         # once; grouping by resource.category happens below instead.
@@ -318,6 +328,7 @@ async def build_device_row_view(dev: Device, scanner: NetworkScanner, expanded: 
             ip=dev.ip, ipv6=dev.ipv6, services=property_entries,
             physical_devices=list(dev.physical_interfaces),
             finders=[FinderEntry(label, source in dev.found_by) for label, source in FINDER_SOURCES],
+            dns_hostname=dev.dns_hostname,
         ),
         names=NamesTabView(
             hostname=dev.hostname, hostname_sources=set(dev.names.get(dev.hostname, set())),

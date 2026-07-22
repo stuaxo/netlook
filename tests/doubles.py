@@ -14,6 +14,7 @@ class FakeScanner:
 
     def __init__(self):
         self.requested = []
+        self.dns_resolved = []
 
     async def request_items(self, service, **kwargs):
         self.requested.append((service, kwargs))
@@ -21,6 +22,9 @@ class FakeScanner:
     async def ensure_fetched(self, service):
         if isinstance(service, Fetchable) and service.fetch_state == FetchState.NOT_FETCHED:
             await self.request_items(service)
+
+    async def ensure_dns_resolved(self, dev):
+        self.dns_resolved.append(dev)
 
 
 class FetchRecordingService:

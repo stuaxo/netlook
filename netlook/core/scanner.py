@@ -32,6 +32,7 @@ from .discovery import (
     MdnsDiscovery,
     SshKnownHostsDiscovery,
     WsdDiscovery,
+    _resolve_reverse_hostname,
 )
 from .models import Device, Fetchable, FetchState, Service, kind_from_type
 
@@ -332,6 +333,22 @@ class NetworkScanner:
 
     async def _fetch_items(self, service: Service, kwargs: dict) -> None:
         await service.fetch(**kwargs)
+        self.dirty = True
+
+    async def ensure_dns_resolved(self, dev: Device) -> None:
+        """Lazily triggers a reverse-DNS (PTR) lookup for a device's address the
+        first time something expresses interest (e.g. a device row expands) -
+        a no-op if already attempted. Mirrors ensure_fetched's gating for
+        Fetchable services; Device.dns_resolved plays the same role
+        fetch_state does there, since a plain reverse lookup has no
+        fetch_state of its own."""
+        if dev.dns_resolved:
+            return
+        dev.dns_resolved = True
+        self._track(self._resolve_dns(dev))
+
+    async def _resolve_dns(self, dev: Device) -> None:
+        dev.dns_hostname = await _resolve_reverse_hostname(dev.ip)
         self.dirty = True
 
     async def wait_idle(self) -> None:

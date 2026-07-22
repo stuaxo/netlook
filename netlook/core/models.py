@@ -299,6 +299,14 @@ class Device:
     # because a queue_probe engine still "finds" a device with no hostname.
     # Drives the Properties tab's "Finders" section.
     found_by: set[str] = field(default_factory=set)
+    # Reverse-DNS (PTR) name for `ip`, or None if none was found - populated
+    # lazily by NetworkScanner.ensure_dns_resolved, never by build_device_row_view
+    # itself. Drives the Properties tab's "DNS" section.
+    dns_hostname: str | None = None
+    # Whether a reverse-DNS lookup has been attempted yet, so
+    # ensure_dns_resolved doesn't repeat one every time a row expands - the
+    # same NOT_FETCHED-style gate Fetchable.fetch_state provides for services.
+    dns_resolved: bool = False
 
     def add_service(self, type_or_name: str, port: int, properties: dict | None = None,
                      discovered_name: str | None = None, ip: str | None = None) -> None:

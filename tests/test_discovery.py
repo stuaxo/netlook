@@ -17,6 +17,7 @@ from netlook.core.discovery import (
     _parse_etc_hosts,
     _parse_known_hosts,
     _pick_address,
+    _resolve_reverse_hostname,
 )
 
 
@@ -121,6 +122,34 @@ async def test_arp_cache_discovery_queues_each_address_with_its_reverse_hostname
         ("192.168.1.253", "alpaca", "arp-cache"),
         ("192.168.1.1", None, "arp-cache"),
     ]
+
+
+@pytest.mark.parametrize("raises, expected", [
+    (False, "alpaca"),
+    (True, None),
+])
+async def test_resolve_reverse_hostname_only_calls_gethostbyaddr_once_per_ip(monkeypatch, raises, expected):
+    """Verify that _resolve_reverse_hostname caches its result per IP, success or
+    failure alike - a second call for the same address returns the cached name (or
+    cached None, for a lookup with no PTR record) without touching
+    socket.gethostbyaddr again, so ArpCacheDiscovery and the Properties tab's DNS
+    section asking about the same device in quick succession only pay for one real
+    PTR lookup."""
+    calls = []
+
+    def fake_gethostbyaddr(ip):
+        calls.append(ip)
+        if raises:
+            raise OSError("no reverse entry")
+        return ("alpaca", [], [ip])
+
+    monkeypatch.setattr(socket, "gethostbyaddr", fake_gethostbyaddr)
+
+    first = await _resolve_reverse_hostname("192.168.1.253")
+    second = await _resolve_reverse_hostname("192.168.1.253")
+
+    assert (first, second) == (expected, expected)
+    assert calls == ["192.168.1.253"]
 
 
 async def test_parse_known_hosts_skips_hashed_lines_and_resolves_local_entries(tmp_path, monkeypatch):

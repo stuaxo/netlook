@@ -303,16 +303,27 @@ async def _resolve_local_hostname(hostname: str) -> str | None:
         return None  # no .local resolver available (e.g. no avahi/nss-mdns) - skip it
 
 
+_reverse_hostname_cache: dict[str, str | None] = {}
+
+
 async def _resolve_reverse_hostname(ip: str) -> str | None:
     """Best-effort PTR/reverse-mDNS lookup, so an address with no name of its
     own (e.g. from ArpCacheDiscovery) can show as more than a bare IP.
     nss-mdns wires this into gethostbyaddr() for .local addresses, same as
-    the forward lookup in _resolve_local_hostname."""
+    the forward lookup in _resolve_local_hostname.
+
+    Cached per IP for the process's lifetime: ArpCacheDiscovery and the
+    Properties tab's DNS section (NetworkScanner.ensure_dns_resolved) can
+    both ask about the same address, and a real PTR lookup is a network
+    round trip worth not repeating in quick succession."""
+    if ip in _reverse_hostname_cache:
+        return _reverse_hostname_cache[ip]
     try:
         name, _aliases, _ips = await asyncio.to_thread(socket.gethostbyaddr, ip)
-        return name
     except OSError:
-        return None  # no reverse entry available - the caller falls back to the IP
+        name = None  # no reverse entry available - the caller falls back to the IP
+    _reverse_hostname_cache[ip] = name
+    return name
 
 
 async def _parse_known_hosts(path: Path) -> AsyncIterator[tuple[str, str | None]]:

@@ -23,9 +23,15 @@ def app_with_device():
     """A NetworkBrowserApp wired to a NetworkScanner with no discovery engines (never
     touches the real network) and one pre-populated device: smb (already fetched,
     one share, no printers - so it's expandable but has no immediate action) and ssh
-    (always has an immediate launch action)."""
+    (always has an immediate launch action). dns_resolved is pre-set for the same
+    reason shares/printers are pre-set here rather than left to a real fetch: an
+    expanded row that still needs to resolve something schedules background work
+    that completes and marks the scanner dirty on its own moment - fine in the real
+    app, but a race against a Pilot test's own timing if a test rebuilds the DOM
+    (via NetworkBrowserApp's periodic auto-refresh) between two of its own steps."""
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("MyNAS", "10.0.0.5", names={"MyNAS": {"device-info"}})
+    dev.dns_resolved = True
     dev.add_service("_smb._tcp.local.", 445, {}, "MyNAS")
     smb = dev.services["smb"]
     smb.shares = [SmbShare("Public")]
@@ -180,6 +186,7 @@ async def test_category_tab_shows_a_fallback_label_for_a_silent_service():
     expanding the row and reading that tab's rendered text."""
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("Printer", "10.0.0.40")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
     dev.services["pdl-datastream"] = PdlStreamService(kind="pdl-datastream", ip="10.0.0.40", port=9100)
     scanner.devices["10.0.0.40"] = dev
     app = NetworkBrowserApp(scanner=scanner)
@@ -211,6 +218,7 @@ async def test_form_submission_runs_the_action_with_typed_values(monkeypatch, po
 
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("MyNAS", "10.0.0.5")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
     dev.add_service("_ssh._tcp.local.", 22, {}, None)
     scanner.devices["10.0.0.5"] = dev
     app = NetworkBrowserApp(scanner=scanner)
@@ -250,6 +258,7 @@ async def test_login_form_submission_calls_request_items_with_typed_credentials(
 
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("MyNAS", "10.0.0.5")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
     dev.add_service("_smb._tcp.local.", 445, {}, "MyNAS")
     dev.services["smb"].auth_required = True
     scanner.devices["10.0.0.5"] = dev
@@ -289,6 +298,7 @@ async def test_properties_tab_shows_decoded_txt_records():
     plain text, by checking the rendered Static content includes the key/value."""
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("MyNAS", "10.0.0.5")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
     dev.add_service("_smb._tcp.local.", 445, {b"vers": b"3.0"}, "MyNAS")
     dev.services["smb"].shares = []
     dev.services["smb"].printers = []
@@ -312,6 +322,7 @@ async def test_properties_sections_default_to_collapsed():
     long, so nothing should be expanded until the user asks for it."""
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("MyNAS", "10.0.0.5")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
     dev.add_service("_smb._tcp.local.", 445, {b"vers": b"3.0"}, "MyNAS")
     dev.services["smb"].shares = []
     dev.services["smb"].printers = []
@@ -325,8 +336,8 @@ async def test_properties_sections_default_to_collapsed():
         await pilot.pause()
 
         properties_pane = app.query_one(TabbedContent).get_pane("tab-properties")
-        # "Finders" (always shown) + "smb" - both start collapsed.
-        assert [c.collapsed for c in properties_pane.query(Collapsible)] == [True, True]
+        # "Finders" + "DNS" (both always shown) + "smb" - all start collapsed.
+        assert [c.collapsed for c in properties_pane.query(Collapsible)] == [True, True, True]
 
 
 async def test_expand_all_button_expands_every_section_and_flips_its_own_label():
@@ -336,6 +347,7 @@ async def test_expand_all_button_expands_every_section_and_flips_its_own_label()
     changed."""
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("MyNAS", "10.0.0.5")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
     dev.add_service("_smb._tcp.local.", 445, {b"vers": b"3.0"}, "MyNAS")
     dev.services["smb"].shares = []
     dev.services["smb"].printers = []
@@ -361,8 +373,8 @@ async def test_expand_all_button_expands_every_section_and_flips_its_own_label()
 
         assert str(toggle_button.label) == "Collapse All"
         properties_pane = app.query_one(TabbedContent).get_pane("tab-properties")
-        # "Finders" (always shown) + "smb" - both now expanded.
-        assert [c.collapsed for c in properties_pane.query(Collapsible)] == [False, False]
+        # "Finders" + "DNS" (both always shown) + "smb" - all now expanded.
+        assert [c.collapsed for c in properties_pane.query(Collapsible)] == [False, False, False]
 
 
 async def test_manually_toggling_a_properties_section_survives_an_unrelated_refresh():
@@ -371,6 +383,7 @@ async def test_manually_toggling_a_properties_section_survives_an_unrelated_refr
     scratch - rather than silently resetting back to collapsed."""
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("MyNAS", "10.0.0.5")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
     dev.add_service("_smb._tcp.local.", 445, {b"vers": b"3.0"}, "MyNAS")
     dev.services["smb"].shares = []
     dev.services["smb"].printers = []
@@ -403,6 +416,7 @@ async def test_properties_tab_shows_physical_devices_when_present():
     setting Device.physical_interfaces directly on a manually-built device."""
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("localhost", "192.168.1.5")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
     dev.physical_interfaces = [("wlan0", "aa:bb:cc:dd:ee:ff")]
     scanner.devices["192.168.1.5"] = dev
     app = NetworkBrowserApp(scanner=scanner)
@@ -426,6 +440,7 @@ async def test_properties_tab_omits_physical_devices_section_without_any():
     section, nothing."""
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("MyNAS", "10.0.0.5")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
     dev.add_service("_smb._tcp.local.", 445, {b"vers": b"3.0"}, "MyNAS")
     dev.services["smb"].shares = []
     dev.services["smb"].printers = []
