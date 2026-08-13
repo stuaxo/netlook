@@ -162,19 +162,19 @@ def popen_calls(monkeypatch):
 @pytest.fixture
 async def net_scanner():
     """A NetworkScanner with no discovery engines and real network probing stubbed
-    out, so tests never touch the network. local_network and
-    local_physical_interfaces are likewise fixed, fake values (rather than the real
-    _detect_local_network()/_detect_local_physical_interfaces(), which reflect
-    whatever's actually present on the machine running the tests) - "192.168.99.1"
-    is chosen to be well outside every IP any other test in this suite uses, so
+    out, so tests never touch the network. local_network and local_interfaces are
+    likewise fixed, fake values (rather than the real
+    _detect_local_network()/_detect_local_interfaces(), which reflect whatever's
+    actually present on the machine running the tests) - "192.168.99.1" is chosen
+    to be well outside every IP any other test in this suite uses, so
     fixture-default local-machine canonicalization never accidentally kicks in for
-    an unrelated test's device IP. local_physical_interfaces defaults to empty
-    (rather than a fake interface) so tests aren't surprised by an unrequested
-    Physical Devices section - tests that specifically want one pass their own."""
+    an unrelated test's device IP. local_interfaces defaults to empty (rather than
+    a fake interface) so tests aren't surprised by an unrequested Network
+    Interfaces section - tests that specifically want one pass their own."""
     net_scanner = NetworkScanner(
         discovery_engines=[],
         local_network=({"127.0.0.1", "192.168.99.1"}, "192.168.99.1"),
-        local_physical_interfaces=[],
+        local_interfaces=[],
     )
 
     async def no_probe(ip, connect_ips=None):

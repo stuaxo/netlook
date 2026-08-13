@@ -89,6 +89,98 @@ async def test_queue_probe_records_its_source_in_found_by(net_scanner):
     assert net_scanner.devices["192.168.1.77"].found_by == {"arp-cache"}
 
 
+async def test_queue_probe_seeds_the_new_devices_own_ip_into_its_addresses(net_scanner):
+    """Verify that queue_probe records a brand-new device's own ip in
+    Device.addresses from the start, tagged with the source that reported
+    it - mirroring how its hostname is seeded into `names` at the same time
+    - so `addresses` is a complete record for every device, not just this
+    machine's own (see NetworkScanner.start's local-interface seeding)."""
+    await net_scanner.queue_probe("192.168.1.50", "nas.lan", source="etc-hosts")
+
+    assert net_scanner.devices["192.168.1.50"].addresses == {"192.168.1.50": {"etc-hosts"}}
+
+
+async def test_queue_probe_with_a_known_mac_folds_a_second_address_into_the_first(net_scanner):
+    """Verify that a second queue_probe call reporting the same MAC as an
+    already-known device's - even under a completely different ip and
+    source - folds into that device's row instead of creating a second,
+    duplicate one. This is the general case _canonicalize_ip only handles for
+    this machine's own addresses, extended to any device via ARP evidence."""
+    await net_scanner.queue_probe("192.168.1.50", "nas.lan", source="etc-hosts", mac="aa:bb:cc:dd:ee:ff")
+    await net_scanner.queue_probe("192.168.1.51", "nas-wifi", source="arp-cache", mac="aa:bb:cc:dd:ee:ff")
+
+    assert set(net_scanner.devices) == {"192.168.1.50"}
+    device = net_scanner.devices["192.168.1.50"]
+    assert device.addresses == {
+        "192.168.1.50": {"etc-hosts"},
+        "192.168.1.51": {"arp-cache"},
+    }
+    assert device.aliases == {"nas-wifi": {"arp-cache"}}
+
+
+async def test_queue_probe_with_different_macs_creates_separate_devices(net_scanner):
+    """Verify that two addresses reporting two different MACs stay two separate
+    devices - MAC evidence only folds addresses together when it actually
+    agrees they're the same host."""
+    await net_scanner.queue_probe("192.168.1.50", "nas", source="arp-cache", mac="aa:bb:cc:dd:ee:ff")
+    await net_scanner.queue_probe("192.168.1.51", "printer", source="arp-cache", mac="11:22:33:44:55:66")
+
+    assert set(net_scanner.devices) == {"192.168.1.50", "192.168.1.51"}
+
+
+async def test_queue_probe_merges_two_already_materialized_devices_on_late_mac_evidence(net_scanner):
+    """Verify that when two rows were already created independently (e.g. one
+    from /etc/hosts, one from ssh known_hosts, each with no MAC available at
+    the time) and the ARP cache later reveals they share a MAC, the two rows
+    merge into one - names, addresses, and found_by from both survive on the
+    surviving row, and the other disappears from `devices` entirely."""
+    await net_scanner.queue_probe("192.168.1.50", "nas.lan", source="etc-hosts")
+    await net_scanner.queue_probe("192.168.1.51", "nas-wifi", source="ssh-known-hosts")
+
+    await net_scanner.queue_probe("192.168.1.50", None, source="arp-cache", mac="aa:bb:cc:dd:ee:ff")
+    await net_scanner.queue_probe("192.168.1.51", None, source="arp-cache", mac="aa:bb:cc:dd:ee:ff")
+
+    assert set(net_scanner.devices) == {"192.168.1.50"}
+    device = net_scanner.devices["192.168.1.50"]
+    assert device.names == {"nas.lan": {"etc-hosts"}, "nas-wifi": {"ssh-known-hosts"}}
+    assert device.addresses == {
+        "192.168.1.50": {"etc-hosts", "arp-cache"},
+        "192.168.1.51": {"ssh-known-hosts", "arp-cache"},
+    }
+    assert device.found_by == {"etc-hosts", "ssh-known-hosts", "arp-cache"}
+
+
+async def test_queue_probe_resolves_through_a_previously_learned_address_without_a_mac(net_scanner):
+    """Verify that once ARP evidence has linked a secondary address to a
+    device, a later report of that same address with no MAC at all (e.g.
+    /etc/hosts, which never has one) still resolves to the right device -
+    the mapping learned via MAC persists independent of whether every later
+    sighting repeats it."""
+    await net_scanner.queue_probe("192.168.1.50", "nas.lan", source="etc-hosts", mac="aa:bb:cc:dd:ee:ff")
+    await net_scanner.queue_probe("192.168.1.51", None, source="arp-cache", mac="aa:bb:cc:dd:ee:ff")
+
+    await net_scanner.queue_probe("192.168.1.51", "nas-wifi.lan", source="etc-hosts")
+
+    assert set(net_scanner.devices) == {"192.168.1.50"}
+    assert net_scanner.devices["192.168.1.50"].aliases == {"nas-wifi.lan": {"etc-hosts"}}
+
+
+async def test_discover_mdns_service_resolves_through_an_already_known_secondary_address(net_scanner, fake_zeroconf):
+    """Verify that discover_mdns_service - which never has a MAC of its own -
+    still folds into an existing device when mDNS announces an address ARP
+    already linked to one, rather than creating an unrelated second row."""
+    await net_scanner.queue_probe("192.168.1.50", "nas.lan", source="etc-hosts", mac="aa:bb:cc:dd:ee:ff")
+    await net_scanner.queue_probe("192.168.1.51", None, source="arp-cache", mac="aa:bb:cc:dd:ee:ff")
+
+    zc = fake_zeroconf(addresses=["192.168.1.51"])
+    await net_scanner.discover_mdns_service(zc, "_smb._tcp.local.", "MyNAS._smb._tcp.local.")
+
+    assert set(net_scanner.devices) == {"192.168.1.50"}
+    device = net_scanner.devices["192.168.1.50"]
+    assert "smb" in device.services
+    assert device.addresses["192.168.1.51"] == {"arp-cache", "mdns"}
+
+
 async def test_start_seeds_the_local_machine_device_with_localhost_as_a_name(net_scanner):
     """Verify that start() pre-seeds the canonical local-machine device with
     "localhost" as its hostname and one of its names, so this machine shows up in
@@ -101,14 +193,14 @@ async def test_start_seeds_the_local_machine_device_with_localhost_as_a_name(net
     assert device.names["localhost"] == {"localhost"}
 
 
-async def test_start_attaches_physical_interfaces_to_the_local_machine_device():
-    """Verify that start() attaches local_physical_interfaces to the seeded
-    local-machine device, so a machine with a real network interface shows a
-    Physical Devices section in its own Properties tab."""
+async def test_start_attaches_interfaces_to_the_local_machine_device():
+    """Verify that start() attaches local_interfaces to the seeded local-machine
+    device, so a machine with a real network interface shows a Network
+    Interfaces section in its own Properties tab."""
     net_scanner = scanner.NetworkScanner(
         discovery_engines=[],
         local_network=({"127.0.0.1", "192.168.99.1"}, "192.168.99.1"),
-        local_physical_interfaces=[("wlan0", "aa:bb:cc:dd:ee:ff")],
+        local_interfaces=[("wlan0", "aa:bb:cc:dd:ee:ff", ["192.168.99.1"])],
     )
 
     async def no_probe(ip, connect_ips=None):
@@ -117,7 +209,45 @@ async def test_start_attaches_physical_interfaces_to_the_local_machine_device():
     net_scanner._probe = no_probe
     await net_scanner.start()
 
-    assert net_scanner.devices["192.168.99.1"].physical_interfaces == [("wlan0", "aa:bb:cc:dd:ee:ff")]
+    assert net_scanner.devices["192.168.99.1"].interfaces == [("wlan0", "aa:bb:cc:dd:ee:ff", ["192.168.99.1"])]
+    await net_scanner.close()
+
+
+@pytest.mark.parametrize("local_ips, canonical", [
+    # This machine's actual interfaces, captured via
+    # `_detect_local_network()` while writing this test: one wifi NIC plus
+    # loopback - the common single-NIC laptop/desktop case.
+    ({"127.0.0.1", "192.168.1.111"}, "192.168.1.111"),
+    # A second NIC bound at the same time (wired + wifi, or a VPN/tailscale
+    # interface) - more than one non-loopback address alongside loopback.
+    ({"127.0.0.1", "192.168.1.111", "10.20.30.5"}, "192.168.1.111"),
+    # No non-loopback interface up at all (e.g. offline/airplane mode) -
+    # loopback is the only, and therefore canonical, address.
+    ({"127.0.0.1"}, "127.0.0.1"),
+])
+async def test_start_records_every_local_ip_as_an_address_of_the_local_machine_device(local_ips, canonical):
+    """Verify that start() records every one of this machine's own local
+    addresses - loopback, LAN, and any extra interface - as a `Device.addresses`
+    entry on the local-machine device, not just the single canonical `ip`. This
+    is the concrete case the addresses feature exists for: one physical machine
+    reachable at several addresses should show up as one row that knows about
+    all of them, not silently lose all but the canonical one. Parametrized with
+    this machine's real interface shape plus two plausible variants (multi-NIC,
+    loopback-only)."""
+    net_scanner = scanner.NetworkScanner(
+        discovery_engines=[], local_network=(local_ips, canonical), local_interfaces=[],
+    )
+
+    async def no_probe(ip, connect_ips=None):
+        pass
+
+    net_scanner._probe = no_probe
+    await net_scanner.start()
+
+    device = net_scanner.devices[canonical]
+    assert device.ip == canonical
+    assert set(device.addresses) == local_ips
+    assert all(device.addresses[ip] == {"local-interface"} for ip in local_ips)
     await net_scanner.close()
 
 
@@ -168,25 +298,60 @@ async def test_probe_prefers_the_lan_address_over_loopback_when_both_answer(monk
     await net_scanner.close()
 
 
-def test_detect_local_physical_interfaces_excludes_the_null_mac(monkeypatch):
-    """Verify that _detect_local_physical_interfaces skips the all-zero MAC every
-    OS reports for loopback - it's a virtual interface, not a physical device, so
-    it shouldn't count toward whether the Physical Devices section has anything to
-    show. A real interface's MAC is kept."""
+def test_detect_local_interfaces_treats_the_null_mac_as_no_mac(monkeypatch):
+    """Verify that _detect_local_interfaces reports the all-zero MAC every OS
+    gives loopback as None rather than a real MAC - it's a virtual interface,
+    not a physical device - while still including the interface, since its
+    address (127.0.0.1) is a genuine one the Network Interfaces section should
+    show. A real interface keeps its MAC.
+
+    Fixture shape is this machine's real interfaces, captured via
+    `psutil.net_if_addrs()` while writing this test: one wifi NIC (IPv4 +
+    IPv6 + MAC) plus loopback (IPv4 + IPv6, null MAC) - IPv6 addresses are
+    present in the raw data but not reflected in the result, since interfaces
+    only surfaces IPv4."""
     class FakeAddr:
         def __init__(self, family, address):
             self.family = family
             self.address = address
 
     fake_addrs = {
-        "lo": [FakeAddr(scanner.psutil.AF_LINK, "00:00:00:00:00:00")],
-        "wlan0": [FakeAddr(scanner.psutil.AF_LINK, "aa:bb:cc:dd:ee:ff")],
+        "lo": [
+            FakeAddr(scanner.socket.AF_INET, "127.0.0.1"),
+            FakeAddr(scanner.socket.AF_INET6, "::1"),
+            FakeAddr(scanner.psutil.AF_LINK, "00:00:00:00:00:00"),
+        ],
+        "wlp192s0": [
+            FakeAddr(scanner.socket.AF_INET, "192.168.1.111"),
+            FakeAddr(scanner.socket.AF_INET6, "fe80::9870:ef43:6f95:ec98%wlp192s0"),
+            FakeAddr(scanner.psutil.AF_LINK, "f4:28:9d:05:18:49"),
+        ],
     }
     monkeypatch.setattr(scanner.psutil, "net_if_addrs", lambda: fake_addrs)
 
-    result = scanner._detect_local_physical_interfaces()
+    result = scanner._detect_local_interfaces()
 
-    assert result == [("wlan0", "aa:bb:cc:dd:ee:ff")]
+    assert result == [
+        ("lo", None, ["127.0.0.1"]),
+        ("wlp192s0", "f4:28:9d:05:18:49", ["192.168.1.111"]),
+    ]
+
+
+def test_detect_local_interfaces_drops_an_interface_with_neither_mac_nor_ipv4(monkeypatch):
+    """Verify that _detect_local_interfaces omits an interface that has no real
+    MAC and no IPv4 address at all - nothing a Network Interfaces row could
+    usefully show, e.g. an IPv6-only tunnel interface."""
+    class FakeAddr:
+        def __init__(self, family, address):
+            self.family = family
+            self.address = address
+
+    fake_addrs = {"tun0": [FakeAddr(scanner.socket.AF_INET6, "fe80::1")]}
+    monkeypatch.setattr(scanner.psutil, "net_if_addrs", lambda: fake_addrs)
+
+    result = scanner._detect_local_interfaces()
+
+    assert result == []
 
 
 def test_detect_local_network_excludes_0_0_0_0(monkeypatch):

@@ -160,9 +160,10 @@ class DeviceRow(Widget):
         before that happens.
 
         A service with nothing to show (no properties, or only
-        blank-decoded keys) is skipped entirely, header included. Physical
-        Devices only has anything to show for this machine's own row (see
-        Device.physical_interfaces), so it's skipped for every other
+        blank-decoded keys) is skipped entirely, header included. Network
+        Interfaces only has anything to show for this machine's own row
+        (see Device.interfaces), so it's skipped for every other device;
+        Addresses is skipped the same way for an ordinary single-address
         device. Finders and DNS always render - Not Found is exactly as
         informative as Found."""
         section_ids = properties_section_ids(self.view.properties)
@@ -200,13 +201,21 @@ class DeviceRow(Widget):
                     collapsed=not self.state.is_properties_section_expanded(self.view.ip, "dns"),
                 ):
                     yield Static(f"  Reverse DNS = {self.view.properties.dns_hostname or 'Not found'}", markup=False)
-                if self.view.properties.physical_devices:
+                if self.view.properties.interfaces:
                     with Collapsible(
-                        title=Text("Physical Devices"), id=self._properties_section_id("physical_devices"),
-                        collapsed=not self.state.is_properties_section_expanded(self.view.ip, "physical_devices"),
+                        title=Text("Network Interfaces"), id=self._properties_section_id("interfaces"),
+                        collapsed=not self.state.is_properties_section_expanded(self.view.ip, "interfaces"),
                     ):
-                        for name, mac in self.view.properties.physical_devices:
-                            yield Static(f"  {name} = {mac}", markup=False)
+                        for name, mac, ips in self.view.properties.interfaces:
+                            addresses = ", ".join(ips) if ips else "—"
+                            yield Static(f"  {name} = {mac or '—'}  ({addresses})", markup=False)
+                if self.view.properties.addresses:
+                    with Collapsible(
+                        title=Text("Addresses"), id=self._properties_section_id("addresses"),
+                        collapsed=not self.state.is_properties_section_expanded(self.view.ip, "addresses"),
+                    ):
+                        for ip, sources in sorted(self.view.properties.addresses.items()):
+                            yield Static(f"  {ip} = {', '.join(sorted(sources))}", markup=False)
                 if shown_services:
                     yield Rule()
                     yield Static(Text("mDNS"), classes="section-heading")
@@ -221,7 +230,16 @@ class DeviceRow(Widget):
 
     def _hostname_static(self) -> Static:
         sources = ", ".join(sorted(self.view.hostname_sources)) or "unknown"
-        return _static_with_tooltip(self.view.hostname, f"Source: {sources}")
+        static = _static_with_tooltip(self.view.hostname, f"Source: {sources}")
+        if not self.view.live:
+            static.add_class("muted")
+        return static
+
+    def _ip_static(self) -> Static:
+        static = Static(f"({self.view.ip})", markup=False)
+        if not self.view.live:
+            static.add_class("muted")
+        return static
 
     def _compose_names_tab(self) -> ComposeResult:
         """The expanded view's first tab: identity (icon - not yet rendered
@@ -243,7 +261,7 @@ class DeviceRow(Widget):
             with Horizontal():
                 yield toggle
                 yield self._hostname_static()
-                yield Static(f"({self.view.ip})", markup=False)
+                yield self._ip_static()
                 yield from self._compose_overview_row()
         else:
             valid_tab_ids = {NAMES_TAB_ID, PROPERTIES_TAB_ID} | {tab.category.name for tab in self.view.category_tabs}
@@ -257,7 +275,7 @@ class DeviceRow(Widget):
                 with Horizontal():
                     yield toggle
                     yield self._hostname_static()
-                    yield Static(f"({self.view.ip})", markup=False)
+                    yield self._ip_static()
                 with TabbedContent(initial=f"tab-{target}"):
                     yield from self._compose_names_tab()
                     for tab in self.view.category_tabs:
@@ -413,6 +431,11 @@ class NetworkBrowserApp(App):
         color: $text-muted; text-style: bold;
         margin-top: 1;
     }
+
+    /* A device found only by non-live finders (e.g. just the ARP cache) may
+       already be gone - hostname/ip render muted to flag that, though every
+       action on the row stays exactly as clickable. See DeviceRowView.live. */
+    .muted { color: $text-muted; }
     """
 
     def __init__(self, scanner: NetworkScanner | None = None):

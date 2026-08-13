@@ -410,14 +410,19 @@ async def test_manually_toggling_a_properties_section_survives_an_unrelated_refr
         assert app.query_one(Collapsible).collapsed is False
 
 
-async def test_properties_tab_shows_physical_devices_when_present():
-    """Verify that the Properties tab renders a Physical Devices section (this
-    machine's own network interfaces, name + MAC) when the device has any, by
-    setting Device.physical_interfaces directly on a manually-built device."""
+async def test_properties_tab_shows_network_interfaces_when_present():
+    """Verify that the Properties tab renders a Network Interfaces section (this
+    machine's own network interfaces, name + MAC + bound addresses) when the
+    device has any, by setting Device.interfaces directly on a manually-built
+    device - including a virtual (MAC-less) loopback interface, since that's the
+    concrete case this section exists to surface."""
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("localhost", "192.168.1.5")
     dev.dns_resolved = True  # see app_with_device's docstring for why
-    dev.physical_interfaces = [("wlan0", "aa:bb:cc:dd:ee:ff")]
+    dev.interfaces = [
+        ("wlan0", "aa:bb:cc:dd:ee:ff", ["192.168.1.5"]),
+        ("lo", None, ["127.0.0.1"]),
+    ]
     scanner.devices["192.168.1.5"] = dev
     app = NetworkBrowserApp(scanner=scanner)
 
@@ -430,13 +435,14 @@ async def test_properties_tab_shows_physical_devices_when_present():
         properties_pane = app.query_one(TabbedContent).get_pane("tab-properties")
         rendered = "\n".join(str(s.content) for s in properties_pane.query("Static"))
 
-        assert "Physical Devices" in rendered
-        assert "wlan0 = aa:bb:cc:dd:ee:ff" in rendered
+        assert "Network Interfaces" in rendered
+        assert "wlan0 = aa:bb:cc:dd:ee:ff  (192.168.1.5)" in rendered
+        assert "lo = —  (127.0.0.1)" in rendered
 
 
-async def test_properties_tab_omits_physical_devices_section_without_any():
-    """Verify that the Properties tab has no Physical Devices section at all for an
-    ordinary device (Device.physical_interfaces defaults to []) - not an empty
+async def test_properties_tab_omits_network_interfaces_section_without_any():
+    """Verify that the Properties tab has no Network Interfaces section at all
+    for an ordinary device (Device.interfaces defaults to []) - not an empty
     section, nothing."""
     scanner = NetworkScanner(discovery_engines=[])
     dev = Device("MyNAS", "10.0.0.5")
@@ -456,7 +462,57 @@ async def test_properties_tab_omits_physical_devices_section_without_any():
         properties_pane = app.query_one(TabbedContent).get_pane("tab-properties")
         rendered = "\n".join(str(s.content) for s in properties_pane.query("Static"))
 
-        assert "Physical Devices" not in rendered
+        assert "Network Interfaces" not in rendered
+
+
+async def test_properties_tab_shows_addresses_when_present():
+    """Verify that the Properties tab renders an Addresses section (any address
+    besides the primary one, e.g. two the ARP cache linked to the same MAC) when
+    the device has any, by setting Device.addresses directly on a manually-built
+    remote device - unlike Network Interfaces, this isn't limited to the local
+    machine's own row."""
+    scanner = NetworkScanner(discovery_engines=[])
+    dev = Device("nas", "10.0.0.5")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
+    dev.addresses = {"10.0.0.5": {"mdns"}, "10.0.0.6": {"arp-cache", "etc-hosts"}}
+    scanner.devices["10.0.0.5"] = dev
+    app = NetworkBrowserApp(scanner=scanner)
+
+    async with app.run_test(size=PILOT_SIZE) as pilot:
+        await pilot.pause()
+        app.view_state.expand("10.0.0.5")
+        await app.refresh_now()
+        await pilot.pause()
+
+        properties_pane = app.query_one(TabbedContent).get_pane("tab-properties")
+        rendered = "\n".join(str(s.content) for s in properties_pane.query("Static"))
+
+        assert "Addresses" in rendered
+        assert "10.0.0.6 = arp-cache, etc-hosts" in rendered
+        assert "10.0.0.5 = mdns" not in rendered  # primary ip stays out of its own Addresses list
+
+
+async def test_properties_tab_omits_addresses_section_without_any():
+    """Verify that the Properties tab has no Addresses section at all for an
+    ordinary single-address device (Device.addresses only has its own primary
+    ip, if anything) - not an empty section, nothing."""
+    scanner = NetworkScanner(discovery_engines=[])
+    dev = Device("MyNAS", "10.0.0.5")
+    dev.dns_resolved = True  # see app_with_device's docstring for why
+    dev.addresses = {"10.0.0.5": {"mdns"}}
+    scanner.devices["10.0.0.5"] = dev
+    app = NetworkBrowserApp(scanner=scanner)
+
+    async with app.run_test(size=PILOT_SIZE) as pilot:
+        await pilot.pause()
+        app.view_state.expand("10.0.0.5")
+        await app.refresh_now()
+        await pilot.pause()
+
+        properties_pane = app.query_one(TabbedContent).get_pane("tab-properties")
+        rendered = "\n".join(str(s.content) for s in properties_pane.query("Static"))
+
+        assert "Addresses" not in rendered
 
 
 async def test_save_button_writes_a_json_file_with_all_devices(monkeypatch, tmp_path):

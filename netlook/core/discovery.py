@@ -58,9 +58,13 @@ DNS_SD_META = "_services._dns-sd._udp.local."
 class ScannerContext(Protocol):
     """The narrow slice of NetworkScanner discovery engines are allowed to touch."""
 
-    async def queue_probe(self, ip: str, hostname: str | None = None, source: str = "") -> None:
+    async def queue_probe(self, ip: str, hostname: str | None = None, source: str = "",
+                           mac: str | None = None) -> None:
         """Register `ip` (optionally naming it, tagged with `source` for the
-        provenance tooltips) as a probe target, and schedule its one-time port probe."""
+        provenance tooltips) as a probe target, and schedule its one-time port
+        probe. `mac`, when known (currently only ArpCacheDiscovery has it),
+        lets the scanner recognise this address as belonging to a device
+        already known under a different address."""
         ...
 
     async def discover_mdns_service(self, zc: AsyncZeroconf, type_: str, name: str) -> None:
@@ -72,6 +76,13 @@ class DiscoveryEngine:
     """Base for a discovery strategy: something that finds candidate hosts and feeds
     them to a scanner context, without needing to know how it turns them into
     Device/Service state."""
+
+    # Whether a report from this engine reflects the network as it is right now,
+    # as opposed to a point-in-time snapshot that may already be stale (e.g. an
+    # ARP cache entry for a host that left the network minutes ago). Drives
+    # whether a device found only by non-live engines renders greyed out - see
+    # LIVE_SOURCES below and ui/base.py's DeviceRowView.live.
+    live: bool = True
 
     async def start(self, scanner_ctx: ScannerContext) -> None:
         raise NotImplementedError
@@ -422,18 +433,22 @@ class EtcHostsDiscovery(DiscoveryEngine):
             await scanner_ctx.queue_probe(ip, alias, source=self.SOURCE)
 
 
-def _parse_arp_cache(path: Path) -> list[str]:
-    """Returns local IPv4 addresses with a complete (link-layer-resolved) entry
-    in the Linux kernel's ARP cache (/proc/net/arp), e.g.
-    "192.168.1.253  0x1  0x2  9c:bf:0d:00:f2:db  *  eth0". Incomplete entries
-    (flags "0x0", zero hardware address - no reply from the address) are
-    skipped. Returns [] on any read failure, including the file not existing
-    on non-Linux platforms."""
+def _parse_arp_cache(path: Path) -> list[tuple[str, str]]:
+    """Returns (ip, mac) pairs for every local IPv4 address with a complete
+    (link-layer-resolved) entry in the Linux kernel's ARP cache
+    (/proc/net/arp), e.g. "192.168.1.253  0x1  0x2  9c:bf:0d:00:f2:db  *
+    eth0". Incomplete entries (flags "0x0", zero hardware address - no reply
+    from the address) are skipped. Returns [] on any read failure, including
+    the file not existing on non-Linux platforms.
+
+    The MAC is what lets the scanner recognise two different addresses (e.g.
+    one from mDNS, one from here) as the same physical host - see
+    NetworkScanner._resolve_address."""
     try:
         lines = path.read_text().splitlines()
     except OSError:
         return []
-    addresses = []
+    entries = []
     for line in lines[1:]:  # header row: "IP address  HW type  Flags  HW address ..."
         parts = line.split()
         if len(parts) < 4:
@@ -442,8 +457,8 @@ def _parse_arp_cache(path: Path) -> list[str]:
         if flags == "0x0" or hw_addr == "00:00:00:00:00:00":
             continue
         if _is_local(ip_text):
-            addresses.append(ip_text)
-    return addresses
+            entries.append((ip_text, hw_addr))
+    return entries
 
 
 class ArpCacheDiscovery(DiscoveryEngine):
@@ -458,24 +473,35 @@ class ArpCacheDiscovery(DiscoveryEngine):
     quietly finds nothing there."""
 
     SOURCE = "arp-cache"
+    # A cache entry is a record of a past exchange, not evidence the host is
+    # still there right now - unlike every other engine here, which reports
+    # something currently observable on the network (an active mDNS
+    # announcement, a live WSD response, a probe that just succeeded).
+    live = False
 
     def __init__(self, path: Path | None = None):
         self.path = path or Path("/proc/net/arp")
 
     async def start(self, scanner_ctx: ScannerContext) -> None:
-        for ip in _parse_arp_cache(self.path):
+        for ip, mac in _parse_arp_cache(self.path):
             hostname = await _resolve_reverse_hostname(ip)
-            await scanner_ctx.queue_probe(ip, hostname, source=self.SOURCE)
+            await scanner_ctx.queue_probe(ip, hostname, source=self.SOURCE, mac=mac)
 
 
-# (display label, SOURCE) for every engine, in the same order NetworkScanner's
+# (display label, SOURCE, live) for every engine, in the same order NetworkScanner's
 # _default_discovery_engines lists them - the Properties tab's "Finders" section
 # (Device.found_by, populated in scanner.py's queue_probe/discover_mdns_service)
 # renders exactly this list, one Found/Not Found row per entry, for every device.
-FINDER_SOURCES: list[tuple[str, str]] = [
-    ("mDNS", MdnsDiscovery.SOURCE),
-    ("SSH known_hosts", SshKnownHostsDiscovery.SOURCE),
-    ("/etc/hosts", EtcHostsDiscovery.SOURCE),
-    ("WSD", WsdDiscovery.SOURCE),
-    ("ARP cache", ArpCacheDiscovery.SOURCE),
+FINDER_SOURCES: list[tuple[str, str, bool]] = [
+    ("mDNS", MdnsDiscovery.SOURCE, MdnsDiscovery.live),
+    ("SSH known_hosts", SshKnownHostsDiscovery.SOURCE, SshKnownHostsDiscovery.live),
+    ("/etc/hosts", EtcHostsDiscovery.SOURCE, EtcHostsDiscovery.live),
+    ("WSD", WsdDiscovery.SOURCE, WsdDiscovery.live),
+    ("ARP cache", ArpCacheDiscovery.SOURCE, ArpCacheDiscovery.live),
 ]
+
+# SOURCE tags of every live engine - a device found by at least one of these is
+# shown normally; a device found only by non-live engines (today, just
+# ArpCacheDiscovery) is rendered greyed out (see ui/base.py's
+# DeviceRowView.live), though every action on it still works exactly the same.
+LIVE_SOURCES: frozenset[str] = frozenset(source for _, source, live in FINDER_SOURCES if live)

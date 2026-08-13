@@ -208,6 +208,56 @@ def test_aliases_excludes_only_the_current_primary_name():
     assert device.aliases == {"MyNAS": {"smb"}, "MyNAS-ssh": {"ssh"}}
 
 
+@pytest.mark.parametrize("ip", ["", "   "])
+def test_promote_address_ignores_blank_addresses(ip):
+    """Verify that Device.promote_address is a no-op for a blank or
+    whitespace-only ip, by checking the primary ip and provenance dict are left
+    untouched."""
+    device = Device("original", "10.0.0.5", addresses={"10.0.0.5": {"seed"}})
+
+    device.promote_address("some-source", ip)
+
+    assert device.ip == "10.0.0.5"
+    assert device.addresses == {"10.0.0.5": {"seed"}}
+
+
+def test_promote_address_demotes_the_current_ip_to_a_secondary_address():
+    """Verify that Device.promote_address makes the new ip primary while keeping
+    the old one discoverable, by promoting a second address and checking the old
+    one survives in `addresses` and reappears via `other_addresses` - mirrors
+    promote_name/aliases for hostnames."""
+    device = Device("MyNAS", "10.0.0.5", addresses={"10.0.0.5": {"arp-cache"}})
+
+    device.promote_address("mdns", "10.0.0.9")
+
+    assert device.ip == "10.0.0.9"
+    assert device.addresses == {"10.0.0.5": {"arp-cache"}, "10.0.0.9": {"mdns"}}
+    assert device.other_addresses == {"10.0.0.5": {"arp-cache"}}
+
+
+def test_add_address_merges_sources_when_two_engines_agree_on_an_address():
+    """Verify that Device.add_address merges sources into a single entry when two
+    different sources report the identical ip, by adding the same ip twice with
+    different sources and checking `addresses` has one entry with both - not
+    two."""
+    device = Device("nas", "10.0.0.9", addresses={"10.0.0.9": {"mdns"}})
+
+    device.add_address("arp-cache", "10.0.0.9")
+
+    assert device.addresses == {"10.0.0.9": {"mdns", "arp-cache"}}
+
+
+def test_other_addresses_excludes_only_the_current_primary_ip():
+    """Verify that Device.other_addresses returns every known address except
+    whichever one is currently primary, by checking an address that used to be
+    primary reappears once a different one is promoted over it."""
+    device = Device("nas", "10.0.0.5", addresses={"10.0.0.5": {"mdns"}, "10.0.0.6": {"wsd"}})
+
+    device.promote_address("device-info", "10.0.0.7")
+
+    assert device.other_addresses == {"10.0.0.5": {"mdns"}, "10.0.0.6": {"wsd"}}
+
+
 def test_smb_host_prefers_an_mdns_name_over_a_wsd_name_and_addresses():
     """Verify that Device.smb_host picks an mDNS-sourced name (suffixed with
     ".local" - see the ".local" test below) ahead of a WSD (wsdd) name and both

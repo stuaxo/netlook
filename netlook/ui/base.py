@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from ..core.actions import Action, display_name
-from ..core.discovery import FINDER_SOURCES
+from ..core.discovery import FINDER_SOURCES, LIVE_SOURCES
 from ..core.models import Device, Fetchable, FetchState, GROUPED_CATEGORIES, Resource, ResourceCategory, Service
 from ..core.scanner import NetworkScanner
 
@@ -108,13 +108,22 @@ class PropertiesTabView:
     ip: str
     ipv6: str | None
     services: list[PropertyEntry]
-    # (interface name, mac address) pairs - empty for every device except this
-    # machine's own entry (see Device.physical_interfaces). A renderer shows the
-    # "Physical Devices" section only when this is non-empty.
-    physical_devices: list[tuple[str, str]]
+    # (interface name, mac address or None, [bound IPv4 addresses]) triples -
+    # empty for every device except this machine's own entry (see
+    # Device.interfaces). A renderer shows the "Network Interfaces" section
+    # only when this is non-empty.
+    interfaces: list[tuple[str, str | None, list[str]]]
+    # Every address other than the primary `ip`, with provenance - mirrors
+    # Device.other_addresses. Unlike interfaces above, this is populated for
+    # any device (a remote multi-homed host the ARP cache linked two
+    # addresses for, not just this machine's own), so it's shown alongside
+    # interfaces rather than only when interfaces is empty - a device can
+    # have both.
+    addresses: dict[str, set[str]]
     # One entry per discovery engine (FINDER_SOURCES order), always present -
-    # unlike physical_devices/services below, this section never disappears, since
-    # "not found by this engine" is exactly as informative as "found by it".
+    # unlike interfaces/addresses/services below, this section never
+    # disappears, since "not found by this engine" is exactly as informative
+    # as "found by it".
     finders: list[FinderEntry]
     # Reverse-DNS (PTR) name for `ip`, or None if none was found (or the lookup
     # hasn't been triggered yet - see build_device_row_view). Always present,
@@ -124,15 +133,17 @@ class PropertiesTabView:
 
 def properties_section_ids(properties: PropertiesTabView) -> list[str]:
     """The ordered list of section identifiers a Properties tab renders as a
-    collapsible block: "finders" and "dns" (always), then "physical_devices" (if
-    non-empty), then each service with at least one non-blank-keyed
-    property - matching the skip condition a renderer applies when deciding
-    whether to draw a section (see _add_properties_tab/
+    collapsible block: "finders" and "dns" (always), then "interfaces" and
+    "addresses" (each if non-empty), then each service with at least one
+    non-blank-keyed property - matching the skip condition a renderer applies
+    when deciding whether to draw a section (see _add_properties_tab/
     _compose_properties_tab), so "expand all"/"collapse all" never touches a
     section that was never shown."""
     ids = ["finders", "dns"]
-    if properties.physical_devices:
-        ids.append("physical_devices")
+    if properties.interfaces:
+        ids.append("interfaces")
+    if properties.addresses:
+        ids.append("addresses")
     ids.extend(entry.kind for entry in properties.services if any(key.strip() for key, _ in entry.properties))
     return ids
 
@@ -158,6 +169,12 @@ class DeviceRowView:
     hostname: str
     hostname_sources: set[str]  # provenance for `hostname` itself - Device.aliases excludes it
     icon_path: str | None
+    # False when every engine that has found this device so far is non-live
+    # (today, only ArpCacheDiscovery - see discovery.LIVE_SOURCES): a stale
+    # cache entry, not something currently observed on the network. Renderers
+    # show such a device greyed out, though it stays fully interactive - a
+    # visual hint, not a restriction.
+    live: bool
     overview: list[ServiceOverviewEntry]
     category_tabs: list[CategoryTabView]  # only categories with a matching service on this device
     properties: PropertiesTabView
@@ -322,12 +339,13 @@ async def build_device_row_view(dev: Device, scanner: NetworkScanner, expanded: 
         hostname=dev.hostname,
         hostname_sources=set(dev.names.get(dev.hostname, set())),
         icon_path=dev.icon_path,
+        live=any(source in LIVE_SOURCES for source in dev.found_by),
         overview=overview,
         category_tabs=category_tabs,
         properties=PropertiesTabView(
             ip=dev.ip, ipv6=dev.ipv6, services=property_entries,
-            physical_devices=list(dev.physical_interfaces),
-            finders=[FinderEntry(label, source in dev.found_by) for label, source in FINDER_SOURCES],
+            interfaces=list(dev.interfaces), addresses=dict(dev.other_addresses),
+            finders=[FinderEntry(label, source in dev.found_by) for label, source, _live in FINDER_SOURCES],
             dns_hostname=dev.dns_hostname,
         ),
         names=NamesTabView(
@@ -368,6 +386,7 @@ def device_row_view_to_dict(view: DeviceRowView) -> dict:
     return {
         "ip": view.ip,
         "hostname": view.hostname,
+        "live": view.live,
         "names": {
             "hostname": view.names.hostname,
             "hostname_sources": sorted(view.names.hostname_sources),
@@ -411,7 +430,8 @@ def device_row_view_to_dict(view: DeviceRowView) -> dict:
                 {"kind": s.kind, "port": s.port, "properties": [list(p) for p in s.properties]}
                 for s in view.properties.services
             ],
-            "physical_devices": [list(p) for p in view.properties.physical_devices],
+            "interfaces": [list(p) for p in view.properties.interfaces],
+            "addresses": {ip: sorted(sources) for ip, sources in view.properties.addresses.items()},
             "finders": [{"label": f.label, "found": f.found} for f in view.properties.finders],
         },
     }

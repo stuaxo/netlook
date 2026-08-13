@@ -68,9 +68,10 @@ def test_parse_etc_hosts_yields_nothing_for_a_missing_file(tmp_path):
 
 
 def test_parse_arp_cache_skips_incomplete_and_public_entries(tmp_path):
-    """Verify that _parse_arp_cache keeps only complete (resolved), local entries
-    from a /proc/net/arp-style fixture, skipping the header row, incomplete entries
-    (flags 0x0 or an all-zero hardware address), and any public IP."""
+    """Verify that _parse_arp_cache keeps only complete (resolved), local (ip,
+    mac) entries from a /proc/net/arp-style fixture, skipping the header row,
+    incomplete entries (flags 0x0 or an all-zero hardware address), and any
+    public IP."""
     arp_file = tmp_path / "arp"
     arp_file.write_text(
         "IP address       HW type     Flags       HW address            Mask     Device\n"
@@ -79,9 +80,9 @@ def test_parse_arp_cache_skips_incomplete_and_public_entries(tmp_path):
         "8.8.8.8          0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0\n"
     )
 
-    addresses = _parse_arp_cache(arp_file)
+    entries = _parse_arp_cache(arp_file)
 
-    assert addresses == ["192.168.1.253"]
+    assert entries == [("192.168.1.253", "9c:bf:0d:00:f2:db")]
 
 
 def test_parse_arp_cache_returns_nothing_for_a_missing_file(tmp_path):
@@ -94,8 +95,9 @@ def test_parse_arp_cache_returns_nothing_for_a_missing_file(tmp_path):
 
 async def test_arp_cache_discovery_queues_each_address_with_its_reverse_hostname(tmp_path, monkeypatch):
     """Verify that ArpCacheDiscovery.start() queues a probe for every address in its
-    /proc/net/arp-style file, tagged with its SOURCE, and attaches a reverse-resolved
-    hostname when one is available - falling back to no hostname when it isn't."""
+    /proc/net/arp-style file, tagged with its SOURCE and MAC, and attaches a
+    reverse-resolved hostname when one is available - falling back to no
+    hostname when it isn't."""
     arp_file = tmp_path / "arp"
     arp_file.write_text(
         "IP address       HW type     Flags       HW address            Mask     Device\n"
@@ -112,15 +114,15 @@ async def test_arp_cache_discovery_queues_each_address_with_its_reverse_hostname
     queued = []
 
     class FakeCtx:
-        async def queue_probe(self, ip, hostname=None, source=""):
-            queued.append((ip, hostname, source))
+        async def queue_probe(self, ip, hostname=None, source="", mac=None):
+            queued.append((ip, hostname, source, mac))
 
     engine = ArpCacheDiscovery(path=arp_file)
     await engine.start(FakeCtx())
 
     assert queued == [
-        ("192.168.1.253", "alpaca", "arp-cache"),
-        ("192.168.1.1", None, "arp-cache"),
+        ("192.168.1.253", "alpaca", "arp-cache", "9c:bf:0d:00:f2:db"),
+        ("192.168.1.1", None, "arp-cache", "ac:8b:a9:63:57:81"),
     ]
 
 

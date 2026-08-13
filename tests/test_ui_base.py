@@ -342,15 +342,40 @@ async def test_properties_leads_with_a_services_extra_properties_before_its_txt_
     assert incus_props.properties == [("error", "not authorized"), ("foo", "bar")]
 
 
-async def test_properties_carries_physical_interfaces_through_from_the_device():
-    """Verify that the Properties view's physical_devices reflects
-    Device.physical_interfaces directly, by checking a device with one set."""
+async def test_properties_carries_interfaces_through_from_the_device():
+    """Verify that the Properties view's interfaces reflects Device.interfaces
+    directly, by checking a device with one set."""
     device = DeviceFactory()
-    device.physical_interfaces = [("wlan0", "aa:bb:cc:dd:ee:ff")]
+    device.interfaces = [("wlan0", "aa:bb:cc:dd:ee:ff", ["192.168.1.111"])]
 
     view = await build_device_row_view(device, scanner=None)
 
-    assert view.properties.physical_devices == [("wlan0", "aa:bb:cc:dd:ee:ff")]
+    assert view.properties.interfaces == [("wlan0", "aa:bb:cc:dd:ee:ff", ["192.168.1.111"])]
+
+
+async def test_properties_addresses_reflects_the_devices_other_addresses():
+    """Verify that the Properties view's addresses reflects Device.other_addresses
+    - every known address except the primary `ip` - so a device the ARP cache
+    linked a second address to shows it here, unlike interfaces above, which
+    stays empty for anything but this machine's own row."""
+    device = DeviceFactory(ip="10.0.0.5")
+    device.addresses = {"10.0.0.5": {"mdns"}, "10.0.0.6": {"arp-cache"}}
+
+    view = await build_device_row_view(device, scanner=None)
+
+    assert view.properties.addresses == {"10.0.0.6": {"arp-cache"}}
+
+
+async def test_properties_addresses_is_empty_for_a_single_address_device():
+    """Verify that the Properties view's addresses is empty for an ordinary
+    device with only its own primary address known - the common case, which is
+    what a renderer uses to decide whether to show the Addresses section at
+    all."""
+    device = DeviceFactory()
+
+    view = await build_device_row_view(device, scanner=None)
+
+    assert view.properties.addresses == {}
 
 
 async def test_properties_finders_reflects_which_engines_reported_the_device():
@@ -412,16 +437,16 @@ async def test_expanding_a_device_row_triggers_dns_resolution():
     assert view.properties.dns_hostname is None
 
 
-async def test_properties_physical_devices_is_empty_without_any():
-    """Verify that the Properties view's physical_devices is empty for an ordinary
-    device (Device.physical_interfaces defaults to []) - the case for every device
-    except this machine's own, which is what a renderer uses to decide whether to
-    show the Physical Devices section at all."""
+async def test_properties_interfaces_is_empty_without_any():
+    """Verify that the Properties view's interfaces is empty for an ordinary
+    device (Device.interfaces defaults to []) - the case for every device except
+    this machine's own, which is what a renderer uses to decide whether to show
+    the Network Interfaces section at all."""
     device = DeviceFactory()
 
     view = await build_device_row_view(device, scanner=None)
 
-    assert view.properties.physical_devices == []
+    assert view.properties.interfaces == []
 
 
 def test_view_model_state_toggle_expanded_flips_membership():
@@ -563,11 +588,11 @@ async def test_save_devices_to_json_writes_saved_at_and_one_entry_per_view(tmp_p
 
 def test_properties_section_ids_matches_what_a_renderer_would_actually_show():
     """Verify that properties_section_ids includes "finders" and "dns" (always),
-    then "physical_devices" (only when non-empty), then each service with at
-    least one non-blank-keyed property, in order - skipping a service whose only
-    properties are blank-keyed (matching a renderer's own skip condition
-    exactly), so Expand All/Collapse All never targets a section that was never
-    drawn."""
+    then "interfaces" and "addresses" (each only when non-empty), then each
+    service with at least one non-blank-keyed property, in order - skipping a
+    service whose only properties are blank-keyed (matching a renderer's own
+    skip condition exactly), so Expand All/Collapse All never targets a
+    section that was never drawn."""
     properties = PropertiesTabView(
         ip="10.0.0.5", ipv6=None,
         services=[
@@ -575,22 +600,24 @@ def test_properties_section_ids_matches_what_a_renderer_would_actually_show():
             PropertyEntry(kind="blank-only", port=1, properties=[("", "(present, no value)")]),
             PropertyEntry(kind="empty", port=2, properties=[]),
         ],
-        physical_devices=[("wlan0", "aa:bb:cc:dd:ee:ff")],
+        interfaces=[("wlan0", "aa:bb:cc:dd:ee:ff", ["192.168.1.111"])],
+        addresses={"10.0.0.6": {"arp-cache"}},
         finders=[FinderEntry("mDNS", True)],
         dns_hostname=None,
     )
 
-    assert properties_section_ids(properties) == ["finders", "dns", "physical_devices", "smb"]
+    assert properties_section_ids(properties) == ["finders", "dns", "interfaces", "addresses", "smb"]
 
 
-def test_properties_section_ids_omits_physical_devices_when_empty():
-    """Verify that properties_section_ids leaves out "physical_devices" entirely
-    when there are none, matching a renderer never drawing that section either -
-    "finders" and "dns" still render regardless."""
+def test_properties_section_ids_omits_interfaces_and_addresses_when_empty():
+    """Verify that properties_section_ids leaves out "interfaces" and
+    "addresses" entirely when there are none, matching a renderer never
+    drawing either section either - "finders" and "dns" still render
+    regardless."""
     properties = PropertiesTabView(
         ip="10.0.0.5", ipv6=None,
         services=[PropertyEntry(kind="smb", port=445, properties=[("vers", "3.0")])],
-        physical_devices=[],
+        interfaces=[], addresses={},
         finders=[FinderEntry("mDNS", False)],
         dns_hostname=None,
     )

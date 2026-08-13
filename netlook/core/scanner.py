@@ -74,17 +74,29 @@ def _detect_local_network() -> tuple[set[str], str]:
 _NULL_MAC = "00:00:00:00:00:00"
 
 
-def _detect_local_physical_interfaces() -> list[tuple[str, str]]:
-    """This machine's network interfaces with a real hardware (MAC) address -
-    (interface name, mac) pairs, e.g. [("wlp192s0", "6e:3a:...")].
+def _detect_local_interfaces() -> list[tuple[str, str | None, list[str]]]:
+    """This machine's network interfaces - (interface name, mac address or
+    None, [bound IPv4 addresses]) triples, e.g.
+    [("wlp192s0", "6e:3a:...", ["192.168.1.111"]), ("lo", None, ["127.0.0.1"])].
 
     Loopback reports psutil.AF_LINK too, but with the null MAC
-    00:00:00:00:00:00 - excluded since it's virtual, not a physical device."""
+    00:00:00:00:00:00 - treated as no MAC (it's virtual, not a physical
+    device) rather than excluding the interface outright, since its address
+    (127.0.0.1) is still a genuine one this machine's Properties tab should
+    show. An interface with neither a real MAC nor any IPv4 address is
+    dropped - nothing to show.
+
+    0.0.0.0 is excluded from the address list for the same reason
+    _detect_local_network excludes it: a misconfigured interface could still
+    report it, and it's not a genuine connectable address."""
     interfaces = []
     for name, addrs in psutil.net_if_addrs().items():
         mac = next((a.address for a in addrs if a.family == psutil.AF_LINK and a.address), None)
-        if mac and mac != _NULL_MAC:
-            interfaces.append((name, mac))
+        if mac == _NULL_MAC:
+            mac = None
+        ips = [a.address for a in addrs if a.family == socket.AF_INET and a.address != "0.0.0.0"]
+        if mac or ips:
+            interfaces.append((name, mac, ips))
     return interfaces
 
 # Each value is a port spec: comma-separated ports and/or "start-end" ranges, e.g.
@@ -259,7 +271,7 @@ def _default_discovery_engines() -> list[DiscoveryEngine]:
 class NetworkScanner:
     def __init__(self, discovery_engines: list[DiscoveryEngine] | None = None,
                  local_network: tuple[set[str], str] | None = None,
-                 local_physical_interfaces: list[tuple[str, str]] | None = None):
+                 local_interfaces: list[tuple[str, str | None, list[str]]] | None = None):
         self.devices: dict[str, Device] = {}
         self.probed: set[str] = set()
         self.dirty = True
@@ -271,8 +283,15 @@ class NetworkScanner:
         # interfaces happen to be present on the machine running the test suite.
         self._local_ips, self._local_canonical_ip = local_network if local_network is not None \
             else _detect_local_network()
-        self._local_physical_interfaces = local_physical_interfaces if local_physical_interfaces is not None \
-            else _detect_local_physical_interfaces()
+        self._local_interfaces = local_interfaces if local_interfaces is not None \
+            else _detect_local_interfaces()
+        # MAC address (from ArpCacheDiscovery) -> the first ip seen for it, and
+        # any ip known to be a secondary address of some other, primary ip -
+        # together these are what let _resolve_address recognise a second
+        # address for an already-known device instead of creating a duplicate
+        # row. See _resolve_address/_merge_devices.
+        self._mac_to_ip: dict[str, str] = {}
+        self._address_index: dict[str, str] = {}
 
     def _canonicalize_ip(self, ip: str) -> str:
         """Maps any of this machine's interface addresses to
@@ -280,6 +299,66 @@ class NetworkScanner:
         collapses into a single Device entry via devices.setdefault(ip, ...)
         rather than a row per interface."""
         return self._local_canonical_ip if ip in self._local_ips else ip
+
+    def _resolve_address(self, ip: str, mac: str | None) -> str:
+        """Maps `ip` to the primary ip of the device it actually belongs to,
+        so a second address for an already-known device folds into the
+        existing row instead of creating a duplicate one - the general case
+        _canonicalize_ip (above) already handles for this machine's own
+        addresses, extended to any device via MAC evidence from the ARP
+        cache.
+
+        A MAC seen for the first time just registers `ip` as that MAC's
+        canonical address, for a later call to fold into. A MAC that maps to
+        a *different*, already-materialized device merges the two rows
+        outright - late-arriving evidence that two addresses discovered
+        independently (e.g. one via mDNS, one via /etc/hosts, both before
+        the ARP cache revealed they're the same host) are actually one
+        device. Without a MAC (every engine but ArpCacheDiscovery), `ip` can
+        still resolve via a mapping an earlier MAC-bearing call already
+        made."""
+        ip = self._canonicalize_ip(ip)
+        if ip in self._address_index:
+            return self._address_index[ip]
+        if mac is None:
+            return ip
+        primary = self._mac_to_ip.get(mac)
+        if primary is None:
+            self._mac_to_ip[mac] = ip
+            return ip
+        primary = self._canonicalize_ip(primary)
+        if primary == ip:
+            return ip
+        if primary in self.devices and ip in self.devices:
+            self._merge_devices(primary, ip)
+        self._address_index[ip] = primary
+        return primary
+
+    def _merge_devices(self, primary_ip: str, secondary_ip: str) -> None:
+        """Folds the device currently at `secondary_ip` into the one at
+        `primary_ip` - late-arriving evidence (see _resolve_address) that two
+        independently-discovered rows are the same physical host. The
+        secondary row disappears from `devices`; the UI's per-frame
+        reconciliation diff already handles a row vanishing while another
+        updates (see dpg.py/textual.py's old-vs-new ip set diffing), so no
+        UI-side merge concept is needed."""
+        secondary = self.devices.pop(secondary_ip)
+        primary = self.devices[primary_ip]
+        for name, sources in secondary.names.items():
+            for source in sources:
+                primary.add_alias(source, name)
+        for addr, sources in secondary.addresses.items():
+            for source in sources:
+                primary.add_address(source, addr)
+        for kind, service in secondary.services.items():
+            primary.services.setdefault(kind, service)
+        primary.found_by |= secondary.found_by
+        if secondary.ipv6 and not primary.ipv6:
+            primary.ipv6 = secondary.ipv6
+        if secondary.icon_path and not primary.icon_path:
+            primary.icon_path = secondary.icon_path
+        self._address_index[secondary_ip] = primary_ip
+        self.dirty = True
 
     async def start(self) -> None:
         # Pre-seed this machine's entry with "localhost", so it's present
@@ -289,7 +368,8 @@ class NetworkScanner:
         self.devices.setdefault(
             self._local_canonical_ip,
             Device("localhost", self._local_canonical_ip, names={"localhost": {"localhost"}},
-                   physical_interfaces=self._local_physical_interfaces),
+                   interfaces=self._local_interfaces,
+                   addresses={ip: {"local-interface"} for ip in self._local_ips}),
         )
         await self._ensure_probed(self._local_canonical_ip)
         for engine in self.discovery_engines:
@@ -362,18 +442,25 @@ class NetworkScanner:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def queue_probe(self, ip: str, hostname: str | None = None, source: str = "") -> None:
+    async def queue_probe(self, ip: str, hostname: str | None = None, source: str = "",
+                           mac: str | None = None) -> None:
         """ScannerContext entry point for discovery engines that only know
-        "here's a candidate host" (ssh known_hosts, /etc/hosts, ...), unlike
-        mDNS's full service detail. Registers the target and name (tagged
-        with `source` for provenance tooltips) and schedules its one-time
-        port probe."""
-        ip = self._canonicalize_ip(ip)
+        "here's a candidate host" (ssh known_hosts, /etc/hosts, ARP cache, ...),
+        unlike mDNS's full service detail. Registers the target and name
+        (tagged with `source` for provenance tooltips) and schedules its
+        one-time port probe. `mac`, when known, may resolve `ip` to a
+        different, already-known device's primary address instead (see
+        _resolve_address) - the probe then targets that address, not the raw
+        `ip` passed in, mirroring how a local-machine address never gets
+        probed separately from its canonical one either."""
+        raw_ip = ip
+        ip = self._resolve_address(raw_ip, mac)
         device = self.devices.setdefault(ip, Device(hostname or ip, ip, names={(hostname or ip): {source}}))
         if hostname:
             device.add_alias(source, hostname)
         if source:
             device.found_by.add(source)
+            device.add_address(source, raw_ip)
         self.dirty = True
         await self._ensure_probed(ip)
 
@@ -384,15 +471,18 @@ class NetworkScanner:
         if not info or not info.parsed_addresses():
             return
         ip4, ip6 = _split_addresses(info.parsed_addresses())
-        ip = self._canonicalize_ip(ip4 or ip6) if (ip4 or ip6) else None
-        if not ip:
+        raw_ip = ip4 or ip6
+        if not raw_ip:
             return
+        # mDNS never gives a MAC, so this can only benefit passively from a
+        # mapping some earlier ArpCacheDiscovery report already made (see
+        # _resolve_address) - it can't create one itself.
+        ip = self._resolve_address(raw_ip, None)
         discovered_name = name.split(".")[0]
         kind = kind_from_type(type_)
 
-        device = self.devices.setdefault(
-            ip, Device(discovered_name, ip, names={discovered_name: {kind}})
-        )
+        device = self.devices.setdefault(ip, Device(discovered_name, ip, names={discovered_name: {kind}}))
+        device.add_address(MdnsDiscovery.SOURCE, raw_ip)
         if ip6 and not device.ipv6:
             device.ipv6 = ip6
         device.add_service(type_, info.port, info.properties, discovered_name)

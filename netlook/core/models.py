@@ -287,13 +287,22 @@ class Device:
     # "smb", "device-info") that reported it. One entry per name, so aliases
     # never show a duplicate.
     names: dict[str, set[str]] = field(default_factory=dict)
+    # Every address any source has reported for this device - ip -> set of source
+    # kinds, same shape and provenance-preserving intent as `names`. `ip` (above)
+    # is always the current primary/display address, kept in sync imperatively by
+    # promote_address rather than derived from this dict, since `ip` is read on
+    # every row render/reconciliation in both UIs and can't afford a dict scan.
+    addresses: dict[str, set[str]] = field(default_factory=dict)
     services: dict[str, Service] = field(default_factory=dict)
-    # (interface name, mac address) pairs. Only ever set for this machine's own
-    # Device entry (see scanner.py's _detect_local_physical_interfaces) - we
-    # have no way to learn another device's interfaces. Empty elsewhere, which
-    # is what the Properties tab's "Physical Devices" section checks to decide
-    # whether to show itself.
-    physical_interfaces: list[tuple[str, str]] = field(default_factory=list)
+    # (interface name, mac address or None, [bound IPv4 addresses]) triples.
+    # Only ever set for this machine's own Device entry (see scanner.py's
+    # _detect_local_interfaces) - we have no way to learn another device's
+    # interfaces, e.g. which of its addresses share a NIC. Empty elsewhere,
+    # which is what the Properties tab's "Network Interfaces" section checks
+    # to decide whether to show itself. mac is None for a virtual interface
+    # (loopback) - it still appears here since its address is still a genuine
+    # one this machine is reachable at.
+    interfaces: list[tuple[str, str | None, list[str]]] = field(default_factory=list)
     # discovery.py engine SOURCE tags that found this device, one per engine
     # regardless of whether it contributed a name. Separate from `names`
     # because a queue_probe engine still "finds" a device with no hostname.
@@ -342,6 +351,28 @@ class Device:
     def aliases(self) -> dict[str, set[str]]:
         """Known names other than the current primary hostname, name -> sources."""
         return {name: sources for name, sources in self.names.items() if name != self.hostname}
+
+    def promote_address(self, source: str, ip: str) -> None:
+        """Record `ip` (reported by `source`) and make it the primary address."""
+        ip = ip.strip()
+        if not ip:
+            return
+        self.addresses.setdefault(ip, set()).add(source)
+        self.ip = ip
+
+    def add_address(self, source: str, ip: str) -> None:
+        """Record `ip` (reported by `source`) as a known address for this device.
+
+        Kept even if it duplicates the primary `ip`, to preserve provenance -
+        `other_addresses` filters it back out for display."""
+        ip = ip.strip()
+        if ip:
+            self.addresses.setdefault(ip, set()).add(source)
+
+    @property
+    def other_addresses(self) -> dict[str, set[str]]:
+        """Known addresses other than the current primary ip, ip -> sources."""
+        return {ip: sources for ip, sources in self.addresses.items() if ip != self.ip}
 
     def _first_name(self, has_source, *, suffix_local: bool = False) -> str | None:
         """First hostname-shaped name in `names` (insertion order) whose

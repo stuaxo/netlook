@@ -635,8 +635,8 @@ def _add_category_tab(dev_view: DeviceRowView, tab: CategoryTabView):
 
 def _add_key_value_grid(rows: list[tuple[str, str]]) -> None:
     """An invisible-grid block of right-aligned bold keys and selectable values -
-    shared by the Properties tab's per-service TXT record blocks and its Physical
-    Devices section, which are visually and structurally identical."""
+    shared by the Properties tab's per-service TXT record blocks and its Network
+    Interfaces section, which are visually and structurally identical."""
     with _invisible_grid():
         _add_grid_columns()
         for key, value in rows:
@@ -679,11 +679,12 @@ def _add_properties_tab(dev_view: DeviceRowView):
     has no callback to hook (see _snapshot_properties_expanded).
 
     A service with nothing to show (no properties, or only blank-decoded
-    keys) is skipped entirely, header included. Physical Devices only has
-    anything to show for this machine's own row (see
-    Device.physical_interfaces), so it's skipped for every other device.
-    Finders and DNS always render - Not Found is exactly as informative as
-    Found."""
+    keys) is skipped entirely, header included. Network Interfaces only has
+    anything to show for this machine's own row (see Device.interfaces), so
+    it's skipped for every other device; Addresses (any address besides the
+    primary one, e.g. two the ARP cache linked to the same MAC) is skipped
+    the same way for an ordinary single-address device. Finders and DNS
+    always render - Not Found is exactly as informative as Found."""
     section_ids = properties_section_ids(dev_view.properties)
     shown_services = []
     for entry in dev_view.properties.services:
@@ -730,13 +731,27 @@ def _add_properties_tab(dev_view: DeviceRowView):
         ):
             _add_key_value_grid([("Reverse DNS", dev_view.properties.dns_hostname or "Not found")])
 
-        if dev_view.properties.physical_devices:
+        if dev_view.properties.interfaces:
             dpg.add_spacer(height=8)
             with dpg.collapsing_header(
-                label="Physical Devices", tag=_properties_section_tag(dev_view.ip, "physical_devices"),
-                default_open=_view_state.is_properties_section_expanded(dev_view.ip, "physical_devices"),
+                label="Network Interfaces", tag=_properties_section_tag(dev_view.ip, "interfaces"),
+                default_open=_view_state.is_properties_section_expanded(dev_view.ip, "interfaces"),
             ):
-                _add_key_value_grid(dev_view.properties.physical_devices)
+                _add_key_value_grid([
+                    (name, f"{mac or '—'}    {', '.join(ips) if ips else '—'}")
+                    for name, mac, ips in dev_view.properties.interfaces
+                ])
+
+        if dev_view.properties.addresses:
+            dpg.add_spacer(height=8)
+            with dpg.collapsing_header(
+                label="Addresses", tag=_properties_section_tag(dev_view.ip, "addresses"),
+                default_open=_view_state.is_properties_section_expanded(dev_view.ip, "addresses"),
+            ):
+                _add_key_value_grid([
+                    (ip, _format_sources_badge(sources))
+                    for ip, sources in sorted(dev_view.properties.addresses.items())
+                ])
 
         if shown_services:
             dpg.add_spacer(height=8)
@@ -753,6 +768,14 @@ def _add_properties_tab(dev_view: DeviceRowView):
                     _add_key_value_grid(properties)
 
 
+def _hostname_theme_for(live: bool):
+    """The bright hostname theme for a device some live engine has actually
+    found, or the same muted theme aliases use for one found only by a
+    non-live engine (today, just the ARP cache) - a possibly-stale record,
+    not something currently observed on the network. See DeviceRowView.live."""
+    return _get_hostname_theme() if live else _get_alias_theme()
+
+
 def _add_identity_line(dev_view: DeviceRowView) -> None:
     """Icon + hostname (with tooltip) - the compact view's leftmost segment. No
     aliases here: the collapsed row stays to one line, so provenance detail is
@@ -761,7 +784,7 @@ def _add_identity_line(dev_view: DeviceRowView) -> None:
     if icon:
         texture, width, height = icon
         dpg.add_image(texture, width=16, height=16)
-    _add_name_with_tooltip(dev_view.hostname, dev_view.hostname_sources, _get_hostname_theme())
+    _add_name_with_tooltip(dev_view.hostname, dev_view.hostname_sources, _hostname_theme_for(dev_view.live))
 
 
 def _add_names_tab(dev_view: DeviceRowView):
@@ -788,7 +811,7 @@ def _add_names_tab(dev_view: DeviceRowView):
                         texture, width, height = icon
                         dpg.add_image(texture, width=16, height=16)
                     name_item = dpg.add_text(names.hostname)
-                    dpg.bind_item_theme(name_item, _get_hostname_theme())
+                    dpg.bind_item_theme(name_item, _hostname_theme_for(dev_view.live))
             for name, sources in sorted(names.aliases.items()):
                 with dpg.table_row():
                     source_item = dpg.add_text(_format_sources_badge(sources))
@@ -831,7 +854,9 @@ def build_device_row(dev_view: DeviceRowView, bridge: CoreBridge, before: int | 
             if not is_open:
                 with dpg.group(horizontal=True):
                     _add_identity_line(dev_view)
-                    dpg.add_text(f"({dev_view.ip})")
+                    ip_item = dpg.add_text(f"({dev_view.ip})")
+                    if not dev_view.live:
+                        dpg.bind_item_theme(ip_item, _get_alias_theme())
                     _add_overview_row(dev_view)
             else:
                 tab_bar_tag = f"tab_bar::{dev_view.ip}"
