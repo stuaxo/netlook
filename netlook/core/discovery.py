@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import socket
 import threading
 import uuid
@@ -233,6 +234,14 @@ async def _pick_address(xaddrs: list[str]) -> tuple[str, str] | None:
         if resolved:
             return resolved, xaddr
     return None
+
+
+# wsdiscovery is client-only: it implements handlers for the replies it
+# expects (Hello/Bye/ProbeMatches/ResolveMatches) but not for Probe/Resolve
+# requests other devices broadcast to each other, so its "daemon" logger
+# warns "could not find handler for: _handle_resolve" whenever such
+# unrelated traffic crosses the wire. Harmless, but noisy - silence it.
+logging.getLogger("daemon").setLevel(logging.ERROR)
 
 
 class WsdDiscovery(DiscoveryEngine):
